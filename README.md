@@ -84,3 +84,7 @@ is no sidebar, so only the status line is used.
 claude plugin validate .
 claude plugin test .
 ```
+
+## License
+
+[The Unlicense](LICENSE): public domain, no conditions and no warranty.
