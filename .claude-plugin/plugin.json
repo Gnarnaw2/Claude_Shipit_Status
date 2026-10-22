@@ -1,0 +1,5 @@
+{
+  "name": "ship-status",
+  "version": "0.2.0",
+  "description": "Shows /ship-it progress on the worktree: a status icon in front of the session title that changes at every step."
+}
