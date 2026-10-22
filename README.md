@@ -44,10 +44,6 @@ From a shell:
 claude plugin install ship-status --marketplace Gnarnaw2/Claude_Shipit_Status
 ```
 
-While the repository is private it installs only for people who can read it on GitHub and whose machine
-already holds a git credential for github.com (an SSH key, or `gh auth login` then `gh auth setup-git`):
-the install never prompts for one.
-
 ## How it knows the step
 
 `ship-it.md` is instructions for the model, so the mod watches what the model runs: Bash and
