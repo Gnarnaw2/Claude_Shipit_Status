@@ -17,6 +17,7 @@ every step:
 | 6 Merge the branch to master | 🚀   |
 | 7 Clean up                   | 🧹   |
 | shipped                      | ✅   |
+| new work since the last ship | ⚡   |
 
 Moments that need you get a mark in front of the step icon: ✋ waiting for you (a confirmation),
 ❌ a command failed (a failed build, a rejected push), 🚧 merge conflicts. A toast also appears for
@@ -24,6 +25,11 @@ the last two. The same text is pinned as a status line under the prompt.
 
 A title reads `✋📝 Add CSV export`. The title is read again at the start of every run, so renaming
 the session by hand between runs is fine: the icon goes in front of the new name.
+
+Once a ship has finished, the ✅ stays only until your next prompt. Then it becomes ⚡ to say new work
+is under way, and it stays that way until the next `/ship-it`. A slash command that starts no turn
+(such as `/ship-status`) does not count. If you would rather have a plain title than a bolt, set
+`working` to `''` in `PHASE_ICON` (`hooks/steps.ts`).
 
 ## Install
 
@@ -64,7 +70,7 @@ is no sidebar, so only the status line is used.
 | `/ship-status demo`                                          | previews every step on the title for about 20 s, then restores it |
 | `/ship-status off`                                           | puts the original title back and leaves the title alone           |
 | `/ship-status on`                                            | marks the title again                                             |
-| `/ship-status step <0-7\|wait\|fail\|conflict\|done\|idle>`  | sets the display by hand if it ever gets out of step              |
+| `/ship-status step <0-7\|wait\|fail\|conflict\|done\|work\|idle>` | sets the display by hand if it ever gets out of step         |
 
 ## Customising
 

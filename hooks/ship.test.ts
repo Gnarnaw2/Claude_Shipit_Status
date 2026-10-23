@@ -15,6 +15,7 @@ const CLEAN = '\u{1F9F9}'
 const HAND = '\u{270B}'
 const CROSS = '\u{274C}'
 const CHECK = '\u{2705}'
+const BOLT = '\u{26A1}'
 
 const BASE = 'Add CSV export'
 
@@ -161,7 +162,7 @@ test('a failed build shows a cross and a toast', async ($, on) => {
   expect(w.toasts).toHaveLength(1)
 })
 
-test('finishing the push ends in a check mark, and the status line goes at the next prompt', async ($, on) => {
+test('finishing the push ends in a check mark; the next prompt clears the status line and makes it a bolt', async ($, on) => {
   const w = world(on)
   await start($)
   await ship($)
@@ -173,8 +174,79 @@ test('finishing the push ends in a check mark, and the status line goes at the n
   expect(w.statuses.at(-1)).toBe(`${CHECK} ship-it: shipped`)
 
   await typed($, 'thanks')
+  await w.settle()
   expect(w.statuses.at(-1)).toBeUndefined()
-  expect(w.titles.at(-1)).toBe(`${CHECK} ${BASE}`)
+  expect(w.titles.at(-1)).toBe(`${BOLT} ${BASE}`)
+})
+
+test('the next prompt after a ship says new work with a bolt; the ship-it turn itself does not', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await startTurn($) // the turn that runs ship-it: a run is under way, so this is not new work
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+
+  await bash($, 'git commit -m x')
+  await bash($, 'git push origin x:master')
+  await endTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+
+  await typed($, 'now add a delete button')
+  await startTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  expect(w.statuses.at(-1)).toBeUndefined()
+
+  await bash($, 'git status') // nothing is being shipped now: the bolt stays
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+})
+
+test('a turn that starts after a ship is new work even with no typed prompt, as a skill command makes', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git push origin x:master')
+  await endTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+
+  await startTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+})
+
+test('a slash command, or a prompt the person did not type, is not new work', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git push origin x:master')
+  await endTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+
+  await slash($, '') // a local command starts no turn
+  await $.prompt.submit({ text: '/model', command: { name: 'model', args: '' }, wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'the background task finished', isMeta: true, wait: false, origin: { kind: 'task-notification' } })
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+})
+
+test('ship-it again after new work starts over from the plain title', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git push origin x:master')
+  await endTurn($)
+  await typed($, 'one more thing')
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
 })
 
 test('a session without the desktop tools gets the status line only, and says so', async ($, on) => {
@@ -268,6 +340,16 @@ test('/ship-status step idle clears a stuck mark', async ($, on) => {
   expect(w.statuses.at(-1)).toBeUndefined()
 })
 
+test('/ship-status step work shows the bolt and pins nothing under the prompt', async ($, on) => {
+  const w = world(on)
+  await start($)
+  const set = await slash($, 'step work')
+  expect(set.text).toBe(`${BOLT} new work since the last ship-it`)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  expect(w.statuses.at(-1)).toBeUndefined()
+})
+
 test('/ship-status demo shows every moment, then puts the title back', async ($, on) => {
   const w = world(on)
   await start($)
@@ -277,7 +359,7 @@ test('/ship-status demo shows every moment, then puts the title back', async ($,
   for (let i = 0; i < DEMO.length; i++) await w.advance(1500)
   await w.settle()
 
-  for (const icon of [SHIP, SYNC, MERGE, BUILD, STAGE, COMMIT, PUSH, CLEAN, CHECK, HAND, CROSS]) {
+  for (const icon of [SHIP, SYNC, MERGE, BUILD, STAGE, COMMIT, PUSH, CLEAN, CHECK, BOLT, HAND, CROSS]) {
     expect(w.titles.some(title => title.includes(icon)), icon).toBe(true)
   }
   expect(w.titles.at(-1)).toBe(BASE)

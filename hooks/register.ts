@@ -1,6 +1,6 @@
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
 
-import { DEMO, LAST_STEP, bare, begin, classify, idle, parseCfg, parseRun, pause, resume, settle, started, statusFor, titleFor } from './steps'
+import { DEMO, LAST_STEP, bare, begin, classify, idle, newWork, parseCfg, parseRun, pause, resume, settle, started, statusFor, titleFor } from './steps'
 import type { Cfg, Run } from './steps'
 
 // The desktop app's own session tools, reached through $.mcp.call. They change
@@ -13,7 +13,7 @@ const USAGE = [
   '/ship-status                where ship-it stands and whether this worktree is being marked',
   '/ship-status demo           preview every step on the title',
   '/ship-status on | off       put the icon on the title, or leave the title alone',
-  '/ship-status step <0-7 | wait | fail | conflict | done | idle>   set it by hand',
+  '/ship-status step <0-7 | wait | fail | conflict | done | work | idle>   set it by hand',
 ].join('\n')
 
 // What this session decided and where its run stands. A reload of the mod starts
@@ -139,8 +139,12 @@ function requestTitle($: EngineInterface, title: string): void {
 
 function render($: EngineInterface): void {
   if (isDemoing || run.phase === 'idle' || cfg?.isOn === false) return
-  $.ui.status(statusFor(run))
-  isStatusShown = true
+  if (run.phase === 'working') {
+    clearStatus($) // the icon on the title says it; nothing needs pinning under the prompt
+  } else {
+    $.ui.status(statusFor(run))
+    isStatusShown = true
+  }
   if (cfg !== undefined && canRename) requestTitle($, titleFor(cfg.base, run))
 
   const needsYou = run.phase === 'failed' || run.phase === 'conflict'
@@ -218,8 +222,12 @@ async function startDemo($: EngineInterface): Promise<string> {
       }
       return
     }
-    $.ui.status(statusFor(frame))
-    isStatusShown = true
+    if (frame.phase === 'working') {
+      clearStatus($) // as for real: the bolt on the title says it
+    } else {
+      $.ui.status(statusFor(frame))
+      isStatusShown = true
+    }
     requestTitle($, titleFor(shown, frame))
     $.clock.after(DEMO_FRAME_MS, tick)
   }
@@ -260,6 +268,8 @@ async function setStep($: EngineInterface, arg: string): Promise<string> {
     run = { ...live, phase: 'conflict' }
   } else if (word === 'done') {
     run = { ...live, phase: 'done', active: false, pushed: true }
+  } else if (word === 'work') {
+    run = { ...live, phase: 'working', active: false, pushed: true }
   } else if (word === 'idle') {
     run = idle()
     if (cfg?.isOn === true) requestTitle($, cfg.base)
@@ -327,9 +337,10 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       await load($)
-      const resumed = resume(run)
-      if (resumed !== run) {
-        run = resumed
+      // A turn that begins after a finished ship (the ship-it turn itself starts a run first) is new work.
+      const moved = newWork(resume(run))
+      if (moved !== run) {
+        run = moved
         commit($)
       }
     }
@@ -348,10 +359,20 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // The "shipped" line has said its piece by the next thing the person types.
+  // The "shipped" line has said its piece by the next thing the person types, and a plain
+  // prompt after a ship is new work: the check mark gives way to a bolt. A slash command
+  // is not (a skill command starts a turn, which turn.start catches), nor is a prompt the
+  // person did not type.
   on('prompt.submit', async ($, e, next) => {
     await load($)
     if (!run.active) clearStatus($)
+    if (e.command === undefined && e.isMeta !== true) {
+      const moved = newWork(run)
+      if (moved !== run) {
+        run = moved
+        commit($)
+      }
+    }
     return next(e)
   })
 

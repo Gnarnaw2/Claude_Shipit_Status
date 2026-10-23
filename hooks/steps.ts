@@ -5,7 +5,8 @@
 // line say about it. Nothing here touches `$`, so ship.test.ts checks it
 // directly and register.ts only wires it to the engine.
 
-export type Phase = 'idle' | 'running' | 'waiting' | 'failed' | 'conflict' | 'done'
+// `done` is a finished ship; `working` is what follows it once the person moves on to new work.
+export type Phase = 'idle' | 'running' | 'waiting' | 'failed' | 'conflict' | 'done' | 'working'
 
 /** How this session's title is marked. */
 export type Cfg = {
@@ -50,6 +51,8 @@ const PHASE_ICON = {
   failed: '\u{274C}', // cross mark
   conflict: '\u{1F6A7}', // construction sign
   done: '\u{2705}', // check mark
+  // New work since the last ship. Set it to '' for a plain title instead of an icon.
+  working: '\u{26A1}', // high voltage (lightning bolt)
 } as const
 
 const COMMITTED = 5
@@ -305,6 +308,11 @@ export function resume(run: Run): Run {
   return run.active && run.phase === 'waiting' ? { ...run, phase: 'running' } : run
 }
 
+/** The person moved on after a ship: the check mark gives way to "new work". A ship still under way is left alone. */
+export function newWork(run: Run): Run {
+  return run.phase === 'done' && !run.active ? { ...run, phase: 'working' } : run
+}
+
 // ---------------------------------------------------------------------------
 // What the person sees
 
@@ -323,7 +331,7 @@ function stepOf(run: Run): { icon: string; label: string } {
 
 /** The icon or icons in front of the title: the step's, with the phase's ahead of it when it needs you. */
 export function marks(run: Run): string {
-  if (run.phase === 'done') return PHASE_ICON.done
+  if (run.phase === 'done' || run.phase === 'working') return PHASE_ICON[run.phase]
   if (run.phase === 'idle' || run.phase === 'running') return stepOf(run).icon
   return PHASE_ICON[run.phase] + stepOf(run).icon
 }
@@ -343,6 +351,8 @@ export function statusFor(run: Run): string {
   switch (run.phase) {
     case 'done':
       return `${m} ship-it: shipped`
+    case 'working':
+      return [m, 'new work since the last ship-it'].filter(part => part !== '').join(' ')
     case 'waiting':
       return `${m} ship-it ${where(run)}: waiting for you`
     case 'failed':
@@ -362,11 +372,11 @@ export function bare(title: string): string {
 }
 
 const frame = (phase: Phase, step: number): Run => ({
-  active: phase !== 'done',
+  active: phase !== 'done' && phase !== 'working',
   step,
   strong: step,
   phase,
-  pushed: phase === 'done',
+  pushed: phase === 'done' || phase === 'working',
 })
 
 /** A walk through every kind of moment, for `/ship-status demo`. */
@@ -384,12 +394,13 @@ export const DEMO: readonly Run[] = [
   frame('running', 6),
   frame('running', 7),
   frame('done', 7),
+  frame('working', 7),
 ]
 
 // ---------------------------------------------------------------------------
 // What was saved
 
-const PHASES: readonly string[] = ['idle', 'running', 'waiting', 'failed', 'conflict', 'done']
+const PHASES: readonly string[] = ['idle', 'running', 'waiting', 'failed', 'conflict', 'done', 'working']
 
 export function parseCfg(raw: unknown): Cfg | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined

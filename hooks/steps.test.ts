@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { DEMO, bare, begin, classify, idle, parseCfg, parseRun, pause, resume, settle, started, statusFor, titleFor } from './steps'
+import { DEMO, bare, begin, classify, idle, newWork, parseCfg, parseRun, pause, resume, settle, started, statusFor, titleFor } from './steps'
 import type { Kind, Outcome, Run } from './steps'
 
 const SHIP = '\u{1F6A2}'
@@ -15,6 +15,7 @@ const HAND = '\u{270B}'
 const CROSS = '\u{274C}'
 const SIGN = '\u{1F6A7}'
 const CHECK = '\u{2705}'
+const BOLT = '\u{26A1}'
 
 const OK: Outcome = { isError: false, text: '' }
 
@@ -199,6 +200,28 @@ describe('a ship-it run', () => {
     expect(at(resume(run))).toBe('1/running')
   })
 
+  test('new work after a ship turns the check mark into a bolt', () => {
+    let run = started()
+    for (const command of ['git commit -m x', 'git push origin x:master']) run = play(run, command)
+    run = pause(run)
+    expect(at(run)).toBe('6/done')
+
+    run = newWork(run)
+    expect(at(run)).toBe('6/working')
+    expect(run.active).toBe(false)
+    expect(newWork(run)).toBe(run) // once is enough
+    expect(play(run, 'git fetch')).toBe(run) // nothing is being shipped now
+  })
+
+  test('new work leaves a ship that is still under way alone', () => {
+    const waiting = pause(play(started(), 'git fetch'))
+    expect(newWork(waiting)).toBe(waiting)
+    const failed = play(started(), 'dotnet build', { isError: true, text: '' })
+    expect(newWork(failed)).toBe(failed)
+    const never = idle()
+    expect(newWork(never)).toBe(never)
+  })
+
   test('does nothing when no run is active', () => {
     const run = idle()
     expect(play(run, 'git fetch')).toBe(run)
@@ -217,6 +240,7 @@ describe('what the person sees', () => {
     expect(titleFor('Add CSV export', at3('failed'))).toBe(`${CROSS}${BUILD} Add CSV export`)
     expect(titleFor('Add CSV export', at3('conflict'))).toBe(`${SIGN}${BUILD} Add CSV export`)
     expect(titleFor('Add CSV export', { ...at3('done'), step: 7 })).toBe(`${CHECK} Add CSV export`)
+    expect(titleFor('Add CSV export', { ...at3('working'), step: 7 })).toBe(`${BOLT} Add CSV export`)
   })
 
   test('every step has its own icon', () => {
@@ -242,6 +266,7 @@ describe('what the person sees', () => {
     expect(statusFor(at3('failed'))).toBe(`${CROSS}${BUILD} ship-it 3/7 Build: failed`)
     expect(statusFor(at3('conflict'))).toBe(`${SIGN}${BUILD} ship-it 3/7 Build: merge conflicts`)
     expect(statusFor({ ...at3('done'), step: 7 })).toBe(`${CHECK} ship-it: shipped`)
+    expect(statusFor({ ...at3('working'), step: 7 })).toBe(`${BOLT} new work since the last ship-it`)
     expect(statusFor(started())).toBe(`${SHIP} ship-it Starting`)
   })
 
@@ -249,13 +274,14 @@ describe('what the person sees', () => {
     expect(bare(`${BUILD} Add CSV export`)).toBe('Add CSV export')
     expect(bare(`${HAND}${COMMIT} Add CSV export`)).toBe('Add CSV export')
     expect(bare(`${CHECK} Add CSV export`)).toBe('Add CSV export')
+    expect(bare(`${BOLT} Add CSV export`)).toBe('Add CSV export')
     expect(bare('Plain title')).toBe('Plain title')
     expect(bare('Fix the 3/7 split')).toBe('Fix the 3/7 split')
   })
 
   test('the demo shows each icon and each moment that needs the person', () => {
     const titles = DEMO.map(run => titleFor('t', run))
-    for (const icon of [SHIP, SYNC, MERGE, BUILD, STAGE, COMMIT, PUSH, CLEAN, CHECK]) {
+    for (const icon of [SHIP, SYNC, MERGE, BUILD, STAGE, COMMIT, PUSH, CLEAN, CHECK, BOLT]) {
       expect(titles.some(title => title.includes(icon))).toBe(true)
     }
     for (const mark of [HAND, CROSS, SIGN]) expect(titles.some(title => title.includes(mark))).toBe(true)
@@ -278,6 +304,8 @@ describe('what was saved', () => {
   test('a saved run comes back, nonsense does not', () => {
     const run: Run = { active: true, step: 4, strong: 3, phase: 'waiting', pushed: false }
     expect(parseRun(run)).toEqual(run)
+    const working: Run = { ...run, active: false, phase: 'working', pushed: true }
+    expect(parseRun(working)).toEqual(working)
     expect(parseRun({ ...run, step: 99 })).toBeUndefined()
     expect(parseRun({ ...run, phase: 'sparkle' })).toBeUndefined()
     expect(parseRun({ ...run, active: 'yes' })).toBeUndefined()
