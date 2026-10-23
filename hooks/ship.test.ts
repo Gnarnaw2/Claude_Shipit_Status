@@ -39,16 +39,32 @@ function world(on: On, options: Options = {}) {
     logs: [] as string[],
     tools: [] as string[],
     nextTool: { isError: false, text: '' },
+    /** Make the next read, or the next title write, never get an answer from the app. */
+    hang: undefined as 'read' | 'rename' | undefined,
+    /** How many title writes the app refuses before it takes them again. */
+    failRenames: 0,
     settle: () => clock.settle(),
     advance: (ms: number) => clock.advance(ms),
   }
 
   on('session.id', () => ({ value: 'test-session' }))
   on('command.register', () => ({ value: { command: 'ship-status' } }))
-  on('mcp.call', (_, e) => {
+  on('mcp.call', async (_, e) => {
     if (options.hasDesktop === false || e.server !== 'ccd_session_mgmt') return { deny: 'no such server' }
     if (e.tool === 'get_session') {
+      if (w.hang === 'read') {
+        w.hang = undefined
+        await new Promise<never>(() => {})
+      }
       return { value: { content: [{ type: 'text', text: JSON.stringify({ title: w.title }) }], isError: false } }
+    }
+    if (w.hang === 'rename') {
+      w.hang = undefined
+      await new Promise<never>(() => {})
+    }
+    if (w.failRenames > 0) {
+      w.failRenames -= 1
+      return { value: { content: [{ type: 'text', text: 'declined' }], isError: true } }
     }
     w.title = String(e.args.title)
     w.titles.push(w.title)
@@ -376,9 +392,12 @@ test('it carries on from what was saved when the mod reloads mid-run', async ($,
   })
   await start($)
   await w.settle()
-  expect(w.titles.at(-1)).toBe(`${HAND}${BUILD} ${BASE}`)
+  expect(w.titles).toEqual([]) // nothing is written at a start: the app is not ready, and resets titles a little later
 
-  await startTurn($)
+  await startTurn($) // the first event of the session puts the mark back
+  await w.settle()
+  expect(w.titles.at(-1)).toBe(`${BUILD} ${BASE}`)
+
   await bash($, 'git add a.cs')
   await w.settle()
   expect(w.titles.at(-1)).toBe(`${STAGE} ${BASE}`)
@@ -403,4 +422,141 @@ test('a tool call with no command is passed straight on', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: undefined as unknown as string })
   await w.settle()
   expect(w.titles).toHaveLength(before)
+})
+
+test('one line that pushes, deletes the branch and re-points the upstream finishes the ship', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git commit -m x')
+  w.nextTool = { isError: false, text: 'To https://example.invalid/repo.git\n   1a2b3c4..5d6e7f8  claude/x -> master\n' }
+  await bash(
+    $,
+    'B=$(git branch --show-current); git fetch -q origin master; git merge-base --is-ancestor origin/master HEAD && git push origin $B:master 2>&1 | tail -2; git push origin --delete $B 2>&1 | tail -1; git branch --set-upstream-to=origin/master',
+  )
+  await endTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+})
+
+test('a title the app resets after the turn is put back a moment later', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git push origin x:master')
+  await endTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+
+  w.title = BASE // the app resets it, as it did in the same second as a finished ship
+  await w.advance(2000) // the mod looks again a moment after the turn
+  await w.settle()
+  expect(w.title).toBe(`${CHECK} ${BASE}`)
+})
+
+test('a new name from the app is kept, with the icon in front of it', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git add a.cs')
+  await endTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${HAND}${STAGE} ${BASE}`)
+
+  w.title = 'Report export polish' // the app made up a new title
+  await w.advance(2000)
+  await w.settle()
+  expect(w.title).toBe(`${HAND}${STAGE} Report export polish`)
+})
+
+test('after a resume the first turn puts the marks back on a reset title', async ($, on) => {
+  const w = world(on, {
+    store: {
+      'cfg:test-session': { isOn: true, base: BASE },
+      'run:test-session': { active: false, step: 6, strong: 6, phase: 'done', pushed: true },
+    },
+  })
+  w.title = BASE // the resume reset the title to plain
+  await start($)
+  await w.advance(5000)
+  await w.settle()
+  expect(w.titles).toEqual([]) // quiet until the person does something
+
+  await typed($, 'one more thing')
+  await startTurn($)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+})
+
+test('a title write the app never answers does not silence the ones after it', async ($, on) => {
+  const w = world(on)
+  await start($)
+  w.hang = 'rename'
+  await ship($) // the first write hangs
+  await w.settle()
+  expect(w.titles).toEqual([])
+
+  await w.advance(7000) // the mod gives up on it after 6 s and writes again
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+
+  await bash($, 'git fetch')
+  await w.settle()
+  expect(w.title).toBe(`${SYNC} ${BASE}`)
+})
+
+test('two refused title writes quiet the mod only until the next ship-it, which tries again', async ($, on) => {
+  const w = world(on)
+  await start($)
+  w.failRenames = 2
+  await ship($)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect((await slash($, '')).text).toContain('stopped after two failures')
+
+  await bash($, 'git fetch')
+  await w.settle()
+  expect(w.titles).toEqual([]) // still quiet
+
+  await ship($) // a new run starts from a clean slate
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+  expect((await slash($, '')).text).toContain('can be changed')
+})
+
+test('a title read the app never answers does not hold up ship-it', async ($, on) => {
+  const w = world(on)
+  await start($)
+  w.hang = 'read'
+  const starting = ship($)
+  await w.advance(5000) // the read is given 4 s
+  await starting
+  await w.settle()
+  expect(w.statuses.at(-1)).toBe(`${SHIP} ship-it Starting`)
+  expect(w.titles).toEqual([])
+  expect(w.logs.some(line => line.includes('cannot reach'))).toBe(true)
+})
+
+test('/ship-status log says what the mod did', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await ship($)
+  await bash($, 'git fetch')
+  await w.settle()
+  const log = (await slash($, 'log')).text
+  expect(log).toContain('ship-it starts')
+  expect(log).toContain('title set')
+  expect(log).toContain('shows step 1')
+})
+
+test('the mod stays quiet about titles until a ship-it has started', async ($, on) => {
+  const w = world(on)
+  await start($)
+  await typed($, 'hello')
+  await startTurn($)
+  await endTurn($)
+  await w.advance(5000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect(w.statuses).toEqual([])
 })

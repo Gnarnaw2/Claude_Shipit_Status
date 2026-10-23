@@ -258,6 +258,17 @@ export function begin(run: Run, kind: Kind): Run {
   return { ...run, step: to.step, strong: to.step, phase: 'running' }
 }
 
+/**
+ * A command line is about to run: show the steps it names. A look at status or diff only counts when
+ * it stands alone, so "git merge ...; git status" shows the merge, not a jump ahead to staging.
+ */
+export function starting(run: Run, kinds: readonly Kind[]): Run {
+  const steps = kinds.filter(kind => kind !== 'look')
+  let next = run
+  for (const kind of steps.length > 0 ? steps : kinds) next = begin(next, kind)
+  return next
+}
+
 export type Outcome = { isError: boolean; text: string }
 
 const CONFLICT = /CONFLICT \(|Automatic merge failed|fix conflicts and then commit|Merge conflict in/i
@@ -285,14 +296,33 @@ function failure(kind: Kind, out: Outcome): 'failed' | 'conflict' | undefined {
   }
 }
 
-/** A command finished: record a failure, a push, or the end of the clean-up. */
-export function settle(run: Run, kind: Kind, out: Outcome): Run {
+// What a push prints (git writes it to stderr) when it worked, and when it was refused.
+const PUSH_DONE = /\b[0-9a-f]{7,40}\.{2,3}[0-9a-f]{7,40}\s+\S+\s+->\s+\S+|\[new branch\]|Everything up-to-date/
+const PUSH_REFUSED = /! \[(?:remote )?rejected\]|error: failed to push|\bnon-fast-forward\b/i
+
+/**
+ * A command line finished. `kinds` are the steps it named, in order, and the outcome is one result for
+ * the whole line. The model often chains "push to master; delete the branch; re-point the upstream" into
+ * one line, so a push that is not the last command is read from its output: an exit status only speaks
+ * for the last command, and the line may have skipped the push altogether.
+ */
+export function settle(run: Run, kinds: readonly Kind[], out: Outcome): Run {
   if (!run.active) return run
-  const bad = failure(kind, out)
-  if (bad !== undefined) return { ...run, phase: bad }
-  if (kind === 'push') return { ...run, pushed: true }
-  if (kind === 'delete' && run.pushed && !out.isError) return { ...run, phase: 'done', active: false }
-  return run
+  const steps = kinds.filter(kind => kind !== 'look')
+  const main = steps[steps.length - 1]
+  if (main === undefined) return run
+
+  const hasPush = steps.includes('push')
+  const isRefused = hasPush && PUSH_REFUSED.test(out.text)
+  const isLastPush = kinds[kinds.length - 1] === 'push'
+  const hasPushed = hasPush && !isRefused && (isLastPush ? !out.isError : PUSH_DONE.test(out.text))
+  const next: Run = hasPushed ? { ...run, pushed: true } : run
+
+  if (isRefused) return { ...next, phase: 'failed' }
+  const bad = failure(main, out)
+  if (bad !== undefined) return { ...next, phase: bad }
+  if (steps.includes('delete') && next.pushed && !out.isError) return { ...next, phase: 'done', active: false }
+  return next
 }
 
 /** The turn ended: shipped if the branch reached master, otherwise it is waiting on the person. */
@@ -364,7 +394,9 @@ export function statusFor(run: Run): string {
   }
 }
 
-const DECORATION = new RegExp(`^[${[...STEPS.map(s => s.icon), ...Object.values(PHASE_ICON)].join('')}]+\\s+`, 'u')
+const ICONS = [...STEPS.map(s => s.icon), ...Object.values(PHASE_ICON)].join('')
+// Runs of icons, each followed by a space: this also undoes icons stacked by two copies of the mod.
+const DECORATION = new RegExp(`^(?:[${ICONS}]+\\s+)+`, 'u')
 
 /** A title with the icons ship-status put in front of it taken off again. */
 export function bare(title: string): string {

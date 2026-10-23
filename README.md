@@ -56,7 +56,7 @@ claude plugin install ship-status --marketplace Gnarnaw2/Claude_Shipit_Status
 PowerShell commands are matched to steps (`git fetch`/`pull` is 1, `git merge` is 2, a build tool is 3,
 `git add` is 4, `git commit` is 5, `git push origin <branch>:master` is 6, `git push --delete` is 7). A
 step never goes backwards once the commit is made, a failed `git push --delete` does not undo a ship,
-and the run is shipped once the push to master succeeds. Nothing is added to the model's prompt and the
+and the run is shipped once the push to master succeeds (a line that chains the push, the branch delete and the upstream re-point is read as a whole, including what the push printed). Nothing is added to the model's prompt and the
 mod never runs git itself.
 
 The title is changed through the desktop app's own `set_session_title` tool. In a plain terminal there
@@ -71,6 +71,24 @@ is no sidebar, so only the status line is used.
 | `/ship-status off`                                           | puts the original title back and leaves the title alone           |
 | `/ship-status on`                                            | marks the title again                                             |
 | `/ship-status step <0-7\|wait\|fail\|conflict\|done\|work\|idle>` | sets the display by hand if it ever gets out of step         |
+| `/ship-status log`                                           | lists what the mod did lately, for when something looks wrong     |
+
+## If it looks wrong
+
+- `/ship-status` shows whether the title can be changed, and the last problem the app reported.
+- `/ship-status log` lists what the mod did lately: the titles it set and anything the app refused.
+- The app sometimes resets a session's title: when the session is resumed, and now and then as a turn
+  ends. A moment after each turn the mod reads the title again and puts its icon back, or keeps a new
+  name if you or the app gave the session one. Right after a resume it writes nothing until your first
+  prompt.
+- A title write that fails, or gets no answer from the app, no longer silences the mod for the rest of
+  the session: the next `/ship-it` starts from a clean slate.
+- You never need `/ship-status on` before `/ship-it`. It is only for turning marking back on after
+  `/ship-status off`.
+- A plugin installed from a marketplace does not update by itself, and `/reload-plugins` only re-reads
+  the installed copy. To get a new version, update the marketplace and the plugin from the app's Plugins
+  menu (or `claude plugin marketplace update` then `claude plugin update ship-status`), then run
+  `/reload-plugins`.
 
 ## Customising
 

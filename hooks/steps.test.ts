@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { DEMO, bare, begin, classify, idle, newWork, parseCfg, parseRun, pause, resume, settle, started, statusFor, titleFor } from './steps'
+import { DEMO, bare, classify, idle, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
 import type { Kind, Outcome, Run } from './steps'
 
 const SHIP = '\u{1F6A2}'
@@ -19,15 +19,17 @@ const BOLT = '\u{26A1}'
 
 const OK: Outcome = { isError: false, text: '' }
 
-/** One command the way the hook sees it: every step it names begins, then the last one settles. */
+/** One command line the way the hook sees it: the steps it names begin, then the whole line settles. */
 function play(run: Run, command: string, out: Outcome = OK): Run {
   const kinds = classify(command)
-  const last = kinds[kinds.length - 1]
-  if (last === undefined) return run
-  let next = run
-  for (const kind of kinds) next = begin(next, kind)
-  return settle(next, last, out)
+  if (kinds.length === 0) return run
+  return settle(starting(run, kinds), kinds, out)
 }
+
+// What the model really ran at the end of a ship: master check, push, branch delete and upstream in one line.
+const CHAIN =
+  'B=$(git branch --show-current); git fetch -q origin master; git merge-base --is-ancestor origin/master HEAD && git push origin $B:master 2>&1 | tail -2; git push origin --delete $B 2>&1 | tail -1; git branch --set-upstream-to=origin/master'
+const PUSHED = 'To https://example.invalid/repo.git\n   1a2b3c4..5d6e7f8  claude/x -> master\n'
 
 const at = (run: Run): string => `${run.step}/${run.phase}`
 
@@ -200,6 +202,48 @@ describe('a ship-it run', () => {
     expect(at(resume(run))).toBe('1/running')
   })
 
+  test('one line that pushes, deletes the branch and re-points the upstream finishes the ship', () => {
+    expect(classify(CHAIN)).toEqual(['fetch-ref', 'merge-base', 'push', 'delete', 'upstream'])
+    let run = play(started(), 'git commit -m x')
+    run = play(run, CHAIN, { isError: false, text: PUSHED })
+    expect(run.pushed).toBe(true)
+    expect(at(run)).toBe('7/done')
+    expect(run.active).toBe(false)
+  })
+
+  test('that line does not finish the ship when the push never ran', () => {
+    let run = play(started(), 'git commit -m x')
+    run = play(run, CHAIN, { isError: false, text: 'To https://example.invalid/repo.git\n - [deleted]         claude/x' })
+    expect(run.pushed).toBe(false)
+    expect(at(run)).toBe('7/running')
+    expect(at(pause(run))).toBe('7/waiting')
+  })
+
+  test('that line fails the ship when the push was refused', () => {
+    let run = play(started(), 'git commit -m x')
+    run = play(run, CHAIN, { isError: false, text: ' ! [rejected]        claude/x -> master (fetch first)\nerror: failed to push some refs' })
+    expect(run.pushed).toBe(false)
+    expect(run.phase).toBe('failed')
+  })
+
+  test('a push as the last command of a line is judged by its exit status', () => {
+    const base = play(started(), 'git commit -m x')
+    expect(play(base, 'git fetch origin master && git push origin x:master').pushed).toBe(true)
+    const failed = play(base, 'git fetch origin master && git push origin x:master', { isError: true, text: '' })
+    expect(failed.pushed).toBe(false)
+    expect(failed.phase).toBe('failed')
+  })
+
+  test('a status or diff at the end of a longer line does not jump ahead', () => {
+    expect(at(play(started(), 'git merge origin/master; git status --short'))).toBe('2/running')
+    expect(at(play(started(), 'git add a.cs; git status --short'))).toBe('4/running')
+  })
+
+  test('a failed build is still seen when a status follows it on the same line', () => {
+    const run = play(started(), 'dotnet build 2>&1 | tail -3; git status --short', { isError: false, text: 'Build FAILED.' })
+    expect(at(run)).toBe('3/failed')
+  })
+
   test('new work after a ship turns the check mark into a bolt', () => {
     let run = started()
     for (const command of ['git commit -m x', 'git push origin x:master']) run = play(run, command)
@@ -275,6 +319,7 @@ describe('what the person sees', () => {
     expect(bare(`${HAND}${COMMIT} Add CSV export`)).toBe('Add CSV export')
     expect(bare(`${CHECK} Add CSV export`)).toBe('Add CSV export')
     expect(bare(`${BOLT} Add CSV export`)).toBe('Add CSV export')
+    expect(bare(`${SHIP} ${BOLT} Add CSV export`)).toBe('Add CSV export') // icons stacked by two copies of the mod
     expect(bare('Plain title')).toBe('Plain title')
     expect(bare('Fix the 3/7 split')).toBe('Fix the 3/7 split')
   })
