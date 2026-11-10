@@ -59,6 +59,15 @@ const COMMITTED = 5
 
 export const idle = (): Run => ({ active: false, step: 0, strong: 0, phase: 'idle', pushed: false })
 export const started = (): Run => ({ ...idle(), active: true, phase: 'running' })
+/** A session that has not shipped yet and is under way: it wears the bolt from its first prompt. */
+export const fresh = (): Run => ({ ...idle(), phase: 'working' })
+
+/** Which new sessions get the bolt from their first prompt: those in a git worktree, all of them, or none. */
+export type NewSessionMark = 'worktree' | 'always' | 'never'
+
+export function marksNewSession(mode: NewSessionMark, isWorktree: boolean): boolean {
+  return mode === 'always' || (mode === 'worktree' && isWorktree)
+}
 
 // ---------------------------------------------------------------------------
 // Reading a shell command
@@ -382,7 +391,7 @@ export function statusFor(run: Run): string {
     case 'done':
       return `${m} ship-it: shipped`
     case 'working':
-      return [m, 'new work since the last ship-it'].filter(part => part !== '').join(' ')
+      return [m, run.pushed ? 'new work since the last ship-it' : 'new work'].filter(part => part !== '').join(' ')
     case 'waiting':
       return `${m} ship-it ${where(run)}: waiting for you`
     case 'failed':
@@ -401,6 +410,16 @@ const DECORATION = new RegExp(`^(?:[${ICONS}]+\\s+)+`, 'u')
 /** A title with the icons ship-status put in front of it taken off again. */
 export function bare(title: string): string {
   return title.replace(DECORATION, '').trim()
+}
+
+// The desktop app asks the person before it replaces a title the person set (an icon typed in by hand
+// counts), and a mod cannot ask. The app says the change "needs their approval"; Claude Code in front
+// of it says the call "needs a person's approval". Writing again changes nothing.
+const APPROVAL_REFUSAL = /\bneeds (?:a person['\u2019]s|their|your|the user['\u2019]s) approval\b|\btitle was set by the user\b/i
+
+/** Whether a refused title write was refused because it needs the person's approval. */
+export function needsApproval(problem: string): boolean {
+  return APPROVAL_REFUSAL.test(problem)
 }
 
 const frame = (phase: Phase, step: number): Run => ({

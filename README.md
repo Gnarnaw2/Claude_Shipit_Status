@@ -31,6 +31,14 @@ is under way, and it stays that way until the next `/ship-it`. A slash command t
 (such as `/ship-status`) does not count. If you would rather have a plain title than a bolt, set
 `working` to `''` in `PHASE_ICON` (`hooks/steps.ts`).
 
+A new session in a git worktree gets the bolt without a ship-it: a few seconds after its first prompt,
+once the app has named the session, ⚡ goes in front of the name, and the first `/ship-it` carries on
+from there. Nobody has to type it in, which matters: a title typed by hand counts as the person's, and
+the desktop app then asks for the person's approval before ship-status may change it (see "If it looks
+wrong"). A session with a history (a resume, an older one) and a session outside a worktree wait for the
+first `/ship-it`. `NEW_SESSION_MARK` in `hooks/register.ts` changes that: `'always'` marks every new
+session, `'never'` none.
+
 ## Install
 
 Needs Claude Code 2.1.304 or newer (older builds do not know function-hook mods).
@@ -69,7 +77,7 @@ is no sidebar, so only the status line is used.
 | `/ship-status`                                               | shows whether this worktree is marked and where ship-it stands    |
 | `/ship-status demo`                                          | previews every step on the title for about 20 s, then restores it |
 | `/ship-status off`                                           | puts the original title back and leaves the title alone           |
-| `/ship-status on`                                            | marks the title again                                             |
+| `/ship-status on`                                            | marks the title again, and tries a title the app refused again    |
 | `/ship-status step <0-7\|wait\|fail\|conflict\|done\|work\|idle>` | sets the display by hand if it ever gets out of step         |
 | `/ship-status log`                                           | lists what the mod did lately, for when something looks wrong     |
 
@@ -83,6 +91,14 @@ is no sidebar, so only the status line is used.
   prompt.
 - A title write that fails, or gets no answer from the app, no longer silences the mod for the rest of
   the session: the next `/ship-it` starts from a clean slate.
+- The desktop app asks the person before it replaces a title the person set, and an icon typed in by
+  hand counts as the person's. A mod cannot ask, so the app (or Claude Code in front of it) refuses the
+  write. ship-status then says so once, stops writing until the next `/ship-it`, and keeps the status
+  line going. To let it carry on, ask Claude to rename the session to the title the message names,
+  approve the app's prompt, and run `/ship-status on`: a title Claude renamed with the person's
+  approval is no longer counted as theirs, so ship-status can change it from then on. A write the mod
+  makes of its own accord (the bolt on a new session, putting an icon back) that the app refuses for
+  this reason is noted in `/ship-status log` and shown by `/ship-status`, but not announced.
 - You never need `/ship-status on` before `/ship-it`. It is only for turning marking back on after
   `/ship-status off`.
 - A plugin installed from a marketplace does not update by itself, and `/reload-plugins` only re-reads
@@ -96,6 +112,8 @@ is no sidebar, so only the status line is used.
   `cargo build`, `go build`, `build*.ps1/.cmd/.sh` and a few more are): add a pattern to `BUILD_HINTS`
   in `hooks/steps.ts`.
 - Icons and step names: `STEPS` and `PHASE_ICON` in `hooks/steps.ts`.
+- Which new sessions get the bolt before any ship-it, and how long the app is given to name them:
+  `NEW_SESSION_MARK` and `NEW_SESSION_DELAY_MS` in `hooks/register.ts`.
 - Another skill or command name than `ship-it`: the matcher on `skill.prompt` in `hooks/register.ts`.
 
 ## Checks

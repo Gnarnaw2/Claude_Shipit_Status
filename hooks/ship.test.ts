@@ -24,6 +24,8 @@ type Options = {
   hasDesktop?: boolean
   /** What the mod's store already holds, as after a reload or a resume. */
   store?: Record<string, unknown>
+  /** True plays a session in a git worktree: the app's description of it names one. */
+  worktree?: boolean
 }
 
 /** The test's stand-in for the desktop app and the engine beneath the mod. */
@@ -43,11 +45,18 @@ function world(on: On, options: Options = {}) {
     hang: undefined as 'read' | 'rename' | undefined,
     /** How many title writes the app refuses before it takes them again. */
     failRenames: 0,
+    /** Refuse every title write as when the person's approval is needed: in the engine's words, or the app's own. */
+    approval: undefined as 'engine' | 'app' | undefined,
+    /** How many title writes were tried. */
+    writes: 0,
+    /** How many prompts the person has sent: 1 is a new session, more is one with a history. */
+    turns: 5,
     settle: () => clock.settle(),
     advance: (ms: number) => clock.advance(ms),
   }
 
   on('session.id', () => ({ value: 'test-session' }))
+  on('session.turns', () => ({ value: w.turns }))
   on('command.register', () => ({ value: { command: 'ship-status' } }))
   on('mcp.call', async (_, e) => {
     if (options.hasDesktop === false || e.server !== 'ccd_session_mgmt') return { deny: 'no such server' }
@@ -56,7 +65,16 @@ function world(on: On, options: Options = {}) {
         w.hang = undefined
         await new Promise<never>(() => {})
       }
-      return { value: { content: [{ type: 'text', text: JSON.stringify({ title: w.title }) }], isError: false } }
+      const session = options.worktree === true ? { title: w.title, worktreeName: 'work-1' } : { title: w.title }
+      return { value: { content: [{ type: 'text', text: JSON.stringify(session) }], isError: false } }
+    }
+    w.writes += 1
+    if (w.approval === 'engine') {
+      return { deny: "mcp__ccd_session_mgmt__set_session_title wasn't run: this call needs a person's approval, and a mod's own call can't ask for it." }
+    }
+    if (w.approval === 'app') {
+      const text = "Could not rename this session: its title was set by the user, and replacing it needs their approval, which isn't available in this context."
+      return { value: { content: [{ type: 'text', text }], isError: true } }
     }
     if (w.hang === 'rename') {
       w.hang = undefined
@@ -522,6 +540,188 @@ test('two refused title writes quiet the mod only until the next ship-it, which 
   await w.settle()
   expect(w.title).toBe(`${SHIP} ${BASE}`)
   expect((await slash($, '')).text).toContain('can be changed')
+})
+
+test('a title the app wants approval for is not written again: the mod says so once and keeps the status line', async ($, on) => {
+  const w = world(on)
+  await start($)
+  w.approval = 'engine'
+  await ship($)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect(w.writes).toBe(1) // one try: asking again changes nothing
+  expect(w.statuses.at(-1)).toBe(`${SHIP} ship-it Starting`)
+  const said = w.logs.filter(line => line.includes('needs your approval'))
+  expect(said).toHaveLength(1)
+  expect(said[0]).toContain(`ask Claude to rename this session to "${SHIP} ${BASE}"`)
+  expect(said[0]).toContain('/ship-status on')
+
+  await bash($, 'git fetch')
+  await w.settle()
+  expect(w.writes).toBe(1) // still quiet
+  expect(w.statuses.at(-1)).toBe(`${SYNC} ship-it 1/7 Sync`)
+  const state = (await slash($, '')).text
+  expect(state).toContain('wants your approval')
+  expect(state).toContain(`rename this session to "${SYNC} ${BASE}"`)
+  expect((await slash($, 'log')).text).toContain("wants the person's approval")
+
+  w.approval = undefined // the person approved a rename Claude made, so the app no longer counts the title as theirs
+  await slash($, 'on')
+  await w.settle()
+  expect(w.title).toBe(`${SYNC} ${BASE}`)
+  expect((await slash($, '')).text).toContain('can be changed')
+})
+
+test("the app's own refusal of a title the person set is handled the same way", async ($, on) => {
+  const w = world(on)
+  await start($)
+  w.approval = 'app'
+  await ship($)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect(w.writes).toBe(1)
+  expect(w.logs.filter(line => line.includes('needs your approval'))).toHaveLength(1)
+  expect((await slash($, '')).text).toContain('wants your approval')
+})
+
+test('the next ship-it tries a title the app refused for approval again', async ($, on) => {
+  const w = world(on)
+  await start($)
+  w.approval = 'engine'
+  await ship($)
+  await w.settle()
+  expect(w.titles).toEqual([])
+
+  w.approval = undefined
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+})
+
+test('a new worktree session gets the bolt once the app has named it, and the first ship-it carries on from there', async ($, on) => {
+  const w = world(on, { worktree: true })
+  w.turns = 1
+  await start($)
+  await startTurn($) // the first prompt
+  await w.advance(7000)
+  await w.settle()
+  expect(w.titles).toEqual([]) // the app is given its moment to name the session first
+  await w.advance(2000)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  expect(w.statuses).toEqual([]) // the bolt on the title says it: nothing is pinned
+  const state = (await slash($, '')).text
+  expect(state).toContain('a status icon in front of the title')
+  expect(state).toContain(`${BOLT} new work`)
+  expect(state).not.toContain('since the last ship-it')
+
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+})
+
+test('a new session waits for the app to name it', async ($, on) => {
+  const w = world(on, { worktree: true })
+  w.turns = 1
+  w.title = '' // not named yet
+  await start($)
+  await startTurn($)
+  await w.advance(8000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  w.title = BASE // now it is
+  await w.advance(4000)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+})
+
+test('a new session the app never names is left alone', async ($, on) => {
+  const w = world(on, { worktree: true })
+  w.turns = 1
+  w.title = ''
+  await start($)
+  await startTurn($)
+  await w.advance(60000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect((await slash($, 'log')).text).toContain('gave it no name')
+})
+
+test('a new session outside a worktree is left alone', async ($, on) => {
+  const w = world(on)
+  w.turns = 1
+  await start($)
+  await startTurn($)
+  await w.advance(20000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect((await slash($, 'log')).text).toContain('not in a worktree')
+})
+
+test('a session that already has a history is left to its first ship-it', async ($, on) => {
+  const w = world(on, { worktree: true }) // five prompts behind it
+  await start($)
+  await startTurn($)
+  await w.advance(20000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect(w.writes).toBe(0)
+})
+
+test('a session the person marked off is not given a bolt', async ($, on) => {
+  const w = world(on, { worktree: true, store: { 'cfg:test-session': { isOn: false, base: BASE } } })
+  w.turns = 1
+  await start($)
+  await startTurn($)
+  await w.advance(20000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+})
+
+test('a ship-it that starts before the bolt goes on takes the session in hand', async ($, on) => {
+  const w = world(on, { worktree: true })
+  w.turns = 1
+  await start($)
+  await startTurn($)
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+  await w.advance(20000)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`) // no late bolt over the ship
+})
+
+test('a title the person already gave the bolt is taken as it is', async ($, on) => {
+  const w = world(on, { worktree: true })
+  w.turns = 1
+  w.title = `${BOLT} ${BASE}`
+  await start($)
+  await startTurn($)
+  await w.advance(9000)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`) // the icon was not taken for part of the name
+})
+
+test('a bolt the app wants approval for is noted but not announced, and the first ship-it says so', async ($, on) => {
+  const w = world(on, { worktree: true })
+  w.turns = 1
+  w.approval = 'engine'
+  await start($)
+  await startTurn($)
+  await w.advance(9000)
+  await w.settle()
+  expect(w.titles).toEqual([])
+  expect(w.writes).toBe(1)
+  expect(w.logs.filter(line => line.includes('needs your approval'))).toEqual([]) // nobody asked for it
+  expect((await slash($, '')).text).toContain('wants your approval')
+
+  await ship($) // the person's own ship-it is worth an explanation
+  await w.settle()
+  expect(w.writes).toBe(2)
+  expect(w.logs.filter(line => line.includes('needs your approval'))).toHaveLength(1)
 })
 
 test('a title read the app never answers does not hold up ship-it', async ($, on) => {

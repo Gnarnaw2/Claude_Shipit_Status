@@ -1,7 +1,7 @@
 import type { EngineInterface, McpToolResult, Register, Timer } from 'claude-code'
 
-import { DEMO, LAST_STEP, bare, classify, idle, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
-import type { Cfg, Run } from './steps'
+import { DEMO, LAST_STEP, bare, classify, fresh, idle, marksNewSession, needsApproval, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
+import type { Cfg, NewSessionMark, Run } from './steps'
 
 // The desktop app's own session tools, reached through $.mcp.call. They change
 // the sidebar entry's title; in a plain terminal the server is absent and
@@ -16,6 +16,15 @@ const RENAME_TIMEOUT_MS = 6000
 const VERIFY_DELAY_MS = 1500
 const MAX_REASSERTS = 3
 const NOTE_LIMIT = 60
+// A new session in a git worktree wears the bolt from its first prompt, so nobody has to type it in: a title
+// typed by hand counts as the person's, and the app then asks for their approval before a mod may change it.
+// 'always' marks every new session, 'never' leaves a session alone until its first ship-it.
+const NEW_SESSION_MARK: NewSessionMark = 'worktree'
+// The app names a new session a moment after its first prompt, and a name given before that would stop it
+// from naming the session at all, so marking waits for the app's name.
+const NEW_SESSION_DELAY_MS = 8000
+const NEW_SESSION_RETRY_MS = 4000
+const NEW_SESSION_TRIES = 8
 
 const USAGE = [
   '/ship-status                where ship-it stands and whether this worktree is being marked',
@@ -46,9 +55,14 @@ let pumpId = 0
 let canRename = true
 let misses = 0
 let sidebarNote = '' // the last thing that went wrong with the sidebar title, '' when nothing has
+let isApprovalNeeded = false // the app wants the person's approval to change this title, so writing again cannot help
+let isQuietAsk = false // the write on its way was nobody's request (a re-check, a new session's bolt): a refusal is noted, not announced
 
 let verifyTimer: Timer | undefined
 let reasserts = 0
+
+let isNewSessionChecked = false // the first turn was looked at: a session is only ever taken for a new one once
+let newSessionTimer: Timer | undefined
 
 const notes: string[] = []
 
@@ -128,7 +142,10 @@ function callApp($: EngineInterface, tool: string, args: Record<string, unknown>
   })
 }
 
-async function readTitle($: EngineInterface): Promise<string | undefined> {
+/** What the app says about this session: its title (undefined while it has none) and whether it lives in a git worktree. */
+type SessionFacts = { title: string | undefined; isWorktree: boolean }
+
+async function readSession($: EngineInterface): Promise<SessionFacts | undefined> {
   const result = await callApp($, 'get_session', { session_id: 'self' }, READ_TIMEOUT_MS)
   if (typeof result === 'string') {
     note(`could not read the title: ${result}`)
@@ -139,21 +156,40 @@ async function readTitle($: EngineInterface): Promise<string | undefined> {
     return undefined
   }
   try {
-    const session: unknown = JSON.parse(textOf(result))
-    const title = typeof session === 'object' && session !== null ? (session as { title?: unknown }).title : undefined
-    if (typeof title !== 'string') return undefined
-    sidebarNote = ''
-    return title
+    const parsed: unknown = JSON.parse(textOf(result))
+    const fields = typeof parsed === 'object' && parsed !== null ? (parsed as { title?: unknown; worktreeName?: unknown }) : {}
+    const title = typeof fields.title === 'string' ? fields.title : undefined
+    if (title !== undefined) sidebarNote = ''
+    return { title, isWorktree: typeof fields.worktreeName === 'string' && fields.worktreeName !== '' }
   } catch {
     note('could not read the title: the answer was not JSON')
     return undefined
   }
 }
 
+async function readTitle($: EngineInterface): Promise<string | undefined> {
+  return (await readSession($))?.title
+}
+
 async function rename($: EngineInterface, title: string): Promise<string | undefined> {
   const result = await callApp($, 'set_session_title', { session_id: 'self', title }, RENAME_TIMEOUT_MS)
   if (typeof result === 'string') return result
   return result.isError ? textOf(result) || 'the app refused the new title' : undefined
+}
+
+function renameRequest(title: string | undefined): string {
+  return title === undefined ? 'rename this session' : `rename this session to "${title}"`
+}
+
+// A mod cannot ask the person to approve a change, but Claude can: the app then asks the person, and
+// once they approve, the title is no longer one the app counts as theirs, so the mod can carry on.
+function approvalAdvice(title: string | undefined): string {
+  return (
+    "could not change this session's title: the app treats it as one you set (an icon typed in by hand counts), " +
+    'so a change needs your approval, and a mod cannot ask for that. ' +
+    `To allow it once, ask Claude to ${renameRequest(title)}, approve the app's prompt, then run /ship-status on. ` +
+    'Until then progress shows in the status line.'
+  )
 }
 
 async function pump($: EngineInterface): Promise<void> {
@@ -172,6 +208,14 @@ async function pump($: EngineInterface): Promise<void> {
         continue
       }
       sidebarNote = problem
+      if (needsApproval(problem)) {
+        // Not a glitch: the same write is refused every time. Stop at once, and say what would help.
+        isApprovalNeeded = true
+        canRename = false
+        note(`the app wants the person's approval to change the title: ${problem}`)
+        if (!isQuietAsk) $.ui.log(`ship-status: ${approvalAdvice(title)}`)
+        break
+      }
       misses += 1
       note(`could not set the title (try ${misses}): ${problem}`)
       if (misses >= 2) {
@@ -187,8 +231,9 @@ async function pump($: EngineInterface): Promise<void> {
 }
 
 // Never awaited by a hook: a slow or waiting app must not hold up a tool call.
-function requestTitle($: EngineInterface, title: string): void {
+function requestTitle($: EngineInterface, title: string, isQuiet = false): void {
   wanted = title
+  isQuietAsk = isQuiet
   if (!isPumping) void pump($)
 }
 
@@ -200,15 +245,19 @@ function resetTitleState(): void {
   demoId += 1 // and a demo still running
   isDemoing = false
   canRename = true
+  isApprovalNeeded = false
   misses = 0
   applied = undefined
   sidebarNote = ''
   reasserts = 0
+  isNewSessionChecked = true // whoever started this took the session in hand: no bolt of the mod's own accord
+  newSessionTimer?.cancel()
+  newSessionTimer = undefined
 }
 
 // ---- showing the run -------------------------------------------------------
 
-function render($: EngineInterface): void {
+function render($: EngineInterface, isQuiet = false): void {
   if (isDemoing || run.phase === 'idle' || cfg?.isOn === false) return
   reasserts = 0
   const shown = `${run.step}:${run.phase}`
@@ -222,7 +271,7 @@ function render($: EngineInterface): void {
     $.ui.status(statusFor(run))
     isStatusShown = true
   }
-  if (cfg !== undefined && canRename) requestTitle($, titleFor(cfg.base, run))
+  if (cfg !== undefined && canRename) requestTitle($, titleFor(cfg.base, run), isQuiet)
 
   const needsYou = run.phase === 'failed' || run.phase === 'conflict'
   const mark = `${run.step}:${run.phase}`
@@ -234,9 +283,9 @@ function render($: EngineInterface): void {
   }
 }
 
-function commit($: EngineInterface): void {
+function commit($: EngineInterface, isQuiet = false): void {
   persist($)
-  render($)
+  render($, isQuiet)
 }
 
 function clearStatus($: EngineInterface): void {
@@ -288,7 +337,58 @@ async function verify($: EngineInterface): Promise<void> {
     note('the icon was reset from outside; putting it back')
   }
   applied = undefined
-  if (cfg !== undefined) requestTitle($, titleFor(cfg.base, run))
+  if (cfg !== undefined) requestTitle($, titleFor(cfg.base, run), true)
+}
+
+// ---- a new session ---------------------------------------------------------
+
+// The first turn of a new session starts the clock for its bolt. A session with prompts behind it (a
+// resume, an older one) is only marked by its first ship-it or /ship-status on.
+async function noticeNewSession($: EngineInterface): Promise<void> {
+  if (isNewSessionChecked) return
+  isNewSessionChecked = true
+  if (cfg !== undefined || run.phase !== 'idle' || !marksNewSession(NEW_SESSION_MARK, true)) return
+  try {
+    if ((await $.session.turns()) > 1) return
+    scheduleNewSession($, NEW_SESSION_DELAY_MS, NEW_SESSION_TRIES)
+  } catch (error) {
+    debug($, `could not tell whether this session is new: ${message(error)}`)
+  }
+}
+
+function scheduleNewSession($: EngineInterface, delayMs: number, tries: number): void {
+  newSessionTimer?.cancel()
+  newSessionTimer = $.clock.after(delayMs, () => {
+    newSessionTimer = undefined
+    void markNewSession($, tries)
+  })
+}
+
+// Puts the bolt on a new session once the app has named it. A ship-it or /ship-status that got there first
+// has taken the session in hand, and a refusal here is noted but not announced: nobody asked for it.
+async function markNewSession($: EngineInterface, tries: number): Promise<void> {
+  try {
+    if (cfg !== undefined || run.phase !== 'idle' || isDemoing) return
+    const session = await readSession($)
+    if (session === undefined || cfg !== undefined || run.phase !== 'idle' || isDemoing) return
+    if (!marksNewSession(NEW_SESSION_MARK, session.isWorktree)) {
+      note(`new session left alone: ${session.isWorktree ? '' : 'not '}in a worktree, marking is ${NEW_SESSION_MARK}`)
+      return
+    }
+    const base = bare(session.title ?? '')
+    if (base === '') {
+      if (tries > 1) scheduleNewSession($, NEW_SESSION_RETRY_MS, tries - 1) // the app has not named it yet
+      else note('new session: the app gave it no name, so it is left alone')
+      return
+    }
+    note(`new session "${base}": the bolt goes on, from its first prompt`)
+    cfg = { isOn: true, base }
+    run = fresh()
+    commit($, true)
+    scheduleVerify($)
+  } catch (error) {
+    debug($, `could not mark a new session: ${message(error)}`)
+  }
 }
 
 // How this session is marked. The title is read again at the start of every run,
@@ -312,16 +412,18 @@ async function choice($: EngineInterface): Promise<Cfg | undefined> {
 function describe(): string {
   const marked =
     cfg === undefined
-      ? 'not started yet (the first ship-it puts the icon on)'
+      ? 'not started yet (the first ship-it puts the icon on; a new worktree session gets the bolt from its first prompt)'
       : cfg.isOn
         ? 'a status icon in front of the title'
         : 'off (/ship-status on turns it back on)'
   const progress = run.phase === 'idle' ? 'no ship-it run in this session yet' : statusFor(run)
-  const sidebar = !canRename
-    ? `stopped after two failures (${sidebarNote}); the next /ship-it or /ship-status on tries again`
-    : sidebarNote !== ''
-      ? `trouble: ${sidebarNote}`
-      : 'can be changed'
+  const sidebar = isApprovalNeeded
+    ? `the app wants your approval (it counts the title as one you set): ask Claude to ${renameRequest(cfg === undefined ? wanted : titleFor(cfg.base, run))}, approve the prompt, then run /ship-status on`
+    : !canRename
+      ? `stopped after two failures (${sidebarNote}); the next /ship-it or /ship-status on tries again`
+      : sidebarNote !== ''
+        ? `trouble: ${sidebarNote}`
+        : 'can be changed'
   return [`Worktree marking: ${marked}`, `ship-it: ${progress}`, `Sidebar title: ${sidebar}`].join('\n')
 }
 
@@ -483,6 +585,7 @@ export const register: Register = on => {
         run = moved
         commit($)
       }
+      await noticeNewSession($)
       scheduleVerify($)
     }
     return next(e)

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { DEMO, bare, classify, idle, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
+import { DEMO, bare, classify, fresh, idle, marksNewSession, needsApproval, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
 import type { Kind, Outcome, Run } from './steps'
 
 const SHIP = '\u{1F6A2}'
@@ -310,7 +310,8 @@ describe('what the person sees', () => {
     expect(statusFor(at3('failed'))).toBe(`${CROSS}${BUILD} ship-it 3/7 Build: failed`)
     expect(statusFor(at3('conflict'))).toBe(`${SIGN}${BUILD} ship-it 3/7 Build: merge conflicts`)
     expect(statusFor({ ...at3('done'), step: 7 })).toBe(`${CHECK} ship-it: shipped`)
-    expect(statusFor({ ...at3('working'), step: 7 })).toBe(`${BOLT} new work since the last ship-it`)
+    expect(statusFor({ ...at3('working'), step: 7, pushed: true })).toBe(`${BOLT} new work since the last ship-it`)
+    expect(statusFor(fresh())).toBe(`${BOLT} new work`) // nothing has shipped yet
     expect(statusFor(started())).toBe(`${SHIP} ship-it Starting`)
   })
 
@@ -330,6 +331,44 @@ describe('what the person sees', () => {
       expect(titles.some(title => title.includes(icon))).toBe(true)
     }
     for (const mark of [HAND, CROSS, SIGN]) expect(titles.some(title => title.includes(mark))).toBe(true)
+  })
+})
+
+describe('a new session', () => {
+  test('is marked in a worktree by default, anywhere with always, nowhere with never', () => {
+    expect(marksNewSession('worktree', true)).toBe(true)
+    expect(marksNewSession('worktree', false)).toBe(false)
+    expect(marksNewSession('always', false)).toBe(true)
+    expect(marksNewSession('never', true)).toBe(false)
+  })
+
+  test('starts under way, with the bolt and no ship behind it, and a ship-it takes over from there', () => {
+    const run = fresh()
+    expect(titleFor('t', run)).toBe(`${BOLT} t`)
+    expect(parseRun(run)).toEqual(run)
+    expect(newWork(run)).toBe(run)
+    expect(pause(run)).toBe(run)
+    expect(at(started())).toBe('0/running')
+  })
+})
+
+describe('a refused title write', () => {
+  test('is recognised when the app wants the person approval, in either wording', () => {
+    const engine =
+      "$.mcp.call(ccd_session_mgmt, set_session_title) refused: mcp__ccd_session_mgmt__set_session_title wasn't run: this call needs a person's approval, and a mod's own call can't ask for it."
+    const app = "Could not rename this session: its title was set by the user, and replacing it needs their approval, which isn't available in this context."
+    const stale = 'Could not rename this session: its title was set by the user and is not the one this call was approved to replace (it may have been renamed since).'
+    expect(needsApproval(engine)).toBe(true)
+    expect(needsApproval(app)).toBe(true)
+    expect(needsApproval(stale)).toBe(true)
+    expect(needsApproval('this call needs a person\u2019s approval')).toBe(true) // a typographic apostrophe
+  })
+
+  test('is not mistaken for an ordinary failure', () => {
+    expect(needsApproval('declined')).toBe(false)
+    expect(needsApproval('no answer from the app after 6s')).toBe(false)
+    expect(needsApproval('the app refused the new title')).toBe(false)
+    expect(needsApproval('')).toBe(false)
   })
 })
 
