@@ -1,6 +1,6 @@
 import type { EngineInterface, McpToolResult, Register, Timer } from 'claude-code'
 
-import { DEMO, LAST_STEP, bare, classify, following, fresh, idle, marked, marksNewSession, needsApproval, newWork, parseCfg, parseRun, parseTopic, pause, recent, resume, settle, started, starting, statusFor, titleFor, topicPrompt, topicRules, worthChecking } from './steps'
+import { DEMO, LAST_STEP, bare, classify, cleanWords, following, fresh, idle, marked, marksNewSession, needsApproval, newWork, parseCfg, parseRun, parseTopic, pause, recent, resume, settle, started, starting, statusFor, titleFor, topicPrompt, topicRules, worthChecking } from './steps'
 import type { Cfg, NewSessionMark, Run } from './steps'
 
 // The desktop app's own session tools, reached through $.mcp.call. They change
@@ -44,6 +44,7 @@ const USAGE = [
   '/ship-status on | off       put the icon on the title, or leave the title alone',
   '/ship-status topic          whether the words of the title follow the work, and what the last check said',
   '/ship-status topic on | off | now   follow the work, stop following it, or check this moment',
+  '/ship-status rename <words>   set the words of the title by hand; the icon stays in front and the checks leave them alone',
   '/ship-status step <0-7 | wait | fail | conflict | done | work | idle>   set it by hand',
   '/ship-status log            what the mod did lately, for when something looks wrong',
 ].join('\n')
@@ -65,6 +66,7 @@ let lastShown = ''
 let wanted: string | undefined
 let applied: string | undefined
 let isPumping = false
+let pumping: Promise<void> | undefined // the write in flight, for a command that tells the person how it went
 let pumpId = 0
 let canRename = true
 let misses = 0
@@ -254,7 +256,7 @@ async function pump($: EngineInterface): Promise<void> {
 function requestTitle($: EngineInterface, title: string, isQuiet = false): void {
   wanted = title
   isQuietAsk = isQuiet
-  if (!isPumping) void pump($)
+  if (!isPumping) pumping = pump($)
 }
 
 // A new ship-it, /ship-status on, step and demo each start from a clean slate: a title write that
@@ -524,6 +526,35 @@ async function setTopic($: EngineInterface, arg: string): Promise<string> {
   return USAGE
 }
 
+// The person sets the words of the title by hand. The mod writes them, so the title stays one it may change
+// later (a title typed into the sidebar counts as the person's, and the app then asks for their approval
+// every time), and the title check keeps out of the way until /ship-status topic on.
+async function setWords($: EngineInterface, arg: string): Promise<string> {
+  const words = cleanWords(arg)
+  if (words === '') {
+    return `Give the new words: /ship-status rename <words>. The icon stays in front${cfg === undefined ? '' : `; the words read "${cfg.base}" now`}.`
+  }
+  resetTitleState()
+  const isMarking = cfg?.isOn !== false
+  cfg = following(marked(cfg, isMarking, words), false)
+  if (isMarking && run.phase === 'idle') run = fresh() // a session nothing has marked yet wears the bolt now
+  note(`renamed by hand: "${words}"`)
+  if (isMarking) {
+    commit($, true)
+    scheduleVerify($)
+  } else {
+    persist($)
+    requestTitle($, words, true)
+  }
+  await pumping
+  const shown = isMarking ? titleFor(words, run) : words
+  if (applied === shown) {
+    return `The title is now "${shown}". The words are yours: the title check leaves them alone until /ship-status topic on.`
+  }
+  if (isApprovalNeeded) return approvalAdvice(shown)
+  return `The app did not take the new title${sidebarNote === '' ? '' : ` (${sidebarNote})`}. /ship-status says more.`
+}
+
 // How this session is marked. The title is read again at the start of every run,
 // so a rename made by hand since the last one becomes the new base. Without a
 // desktop-app title to read there is nothing to put an icon on: only the status
@@ -674,7 +705,7 @@ export const register: Register = on => {
       await $.command.register({
         name: 'ship-status',
         description: "Show or adjust how /ship-it progress and the session's work are marked on its title",
-        argumentHint: '[demo | on | off | topic | step | log]',
+        argumentHint: '[demo | on | off | topic | rename | step | log]',
       })
     } catch (error) {
       debug($, `could not register /ship-status: ${message(error)}`)
@@ -782,6 +813,8 @@ export const register: Register = on => {
         return { text: await setMarking($, false) }
       case 'topic':
         return { text: await setTopic($, arg) }
+      case 'rename':
+        return { text: await setWords($, arg) }
       case 'step':
         return { text: await setStep($, arg) }
       case 'log':

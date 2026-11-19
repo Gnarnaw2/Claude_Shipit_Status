@@ -967,6 +967,87 @@ test('a check that finishes after ship-status was turned off changes nothing', a
   expect((await slash($, 'log')).text).toContain('dropped')
 })
 
+// ---- /ship-status rename ----------------------------------------------------------
+
+const MINE = 'Release notes draft'
+
+test('/ship-status rename sets the words by hand, and the title check stays out of the way until topic on', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  const said = (await slash($, `rename ${MINE}`)).text
+  expect(said).toContain(`The title is now "${BOLT} ${MINE}"`)
+  expect(said).toContain('/ship-status topic on')
+  expect(w.title).toBe(`${BOLT} ${MINE}`)
+
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toEqual([]) // the words are the person's now
+
+  await slash($, 'topic on')
+  w.answers = [`NEW: ${MOVED}`]
+  await typed($, `${LONG} again`)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${MOVED}`)
+})
+
+test('a ship-it carries on from words set by hand', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  await slash($, `rename ${MINE}`)
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${MINE}`)
+  await bash($, 'git fetch')
+  await w.settle()
+  expect(w.title).toBe(`${SYNC} ${MINE}`)
+})
+
+test('/ship-status rename on a session nothing has marked puts the bolt on it', async ($, on) => {
+  const w = world(on) // five prompts behind it, and no ship-it yet
+  await start($)
+  await slash($, `rename ${MINE}`)
+  expect(w.title).toBe(`${BOLT} ${MINE}`)
+  expect((await slash($, '')).text).toContain('a status icon in front of the title')
+})
+
+test('/ship-status rename while ship-status is off writes the words plain', async ($, on) => {
+  const w = world(on, { store: { 'cfg:test-session': { isOn: false, base: BASE } } })
+  await start($)
+  const said = (await slash($, `rename ${MINE}`)).text
+  expect(said).toContain(`The title is now "${MINE}"`)
+  expect(w.title).toBe(MINE)
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(MINE) // still off: ship-it leaves it alone
+})
+
+test('/ship-status rename drops an icon typed in front and the extra spaces', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  await slash($, `rename ${SHIP}   Release   notes   draft`)
+  expect(w.title).toBe(`${BOLT} ${MINE}`)
+})
+
+test('/ship-status rename with no words says how, and writes nothing', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  const writes = w.writes
+  expect((await slash($, 'rename')).text).toContain('/ship-status rename <words>')
+  expect((await slash($, `rename ${BOLT}`)).text).toContain('/ship-status rename <words>')
+  expect(w.writes).toBe(writes)
+})
+
+test('/ship-status rename on a title the app wants approval for says how to unlock it, in its answer', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.approval = 'engine'
+  const said = (await slash($, `rename ${MINE}`)).text
+  expect(said).toContain('treats it as one you set')
+  expect(said).toContain(`rename this session to "${BOLT} ${MINE}"`)
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  expect(w.logs.filter(line => line.includes('treats it as one you set'))).toEqual([]) // said once, in the answer
+})
+
 test('a question the model never answers does not stop the next one for good', async ($, on) => {
   const w = world(on)
   await boltOn($, w)

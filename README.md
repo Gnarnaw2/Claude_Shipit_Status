@@ -61,6 +61,10 @@ carries on from the new words: `⚡ Invoice PDF page breaks`, then `🔨 Invoice
   working.
 - `/ship-status topic off` keeps the words of one session as they are. `TOPIC_TITLES` in
   `hooks/register.ts` turns the checks off for every session.
+- If you do not like a title, `/ship-status rename <words>` sets it. The icon stays in front, the next
+  `/ship-it` carries on from your words, and the checks leave them alone until `/ship-status topic on`.
+  The mod writes the title, so it stays one the mod may keep changing. Typing a title into the sidebar
+  yourself would lock it (see "If it looks wrong").
 - A title you typed by hand is yours: the app asks for your approval before the mod may replace it, and a
   mod cannot ask. ship-status then says so once and stops (see "If it looks wrong").
 
@@ -106,6 +110,7 @@ is no sidebar, so only the status line is used.
 | `/ship-status topic`                                         | says whether the words follow the work, and what the last check came to |
 | `/ship-status topic on\|off`                                  | makes the words of this session follow the work, or stay as they are |
 | `/ship-status topic now`                                     | checks this moment, and tries again after the checks gave up      |
+| `/ship-status rename <words>`                                | sets the words of the title by hand, and keeps the checks away from them |
 | `/ship-status step <0-7\|wait\|fail\|conflict\|done\|work\|idle>` | sets the display by hand if it ever gets out of step         |
 | `/ship-status log`                                           | lists what the mod did lately, for when something looks wrong     |
 

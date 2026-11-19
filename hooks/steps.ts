@@ -558,6 +558,11 @@ export function cleanTopic(raw: string, max: number): string {
   return fitTitle(text.replace(WRAPPING, '').replace(LABEL, '').replace(WRAPPING, '').replace(TAIL, ''), max)
 }
 
+/** The words a person typed for a title: one line, with no icon of ship-status's in front. */
+export function cleanWords(raw: string): string {
+  return bare(`${raw.replace(/\p{Cc}+/gu, ' ').replace(/\s+/g, ' ').trim()} `)
+}
+
 /** Whether two titles say the same words, whatever their case or punctuation. */
 export function sameWords(a: string, b: string): boolean {
   return a.toLowerCase().replace(NOT_WORD, '') === b.toLowerCase().replace(NOT_WORD, '')

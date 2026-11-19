@@ -1,5 +1,5 @@
 {
   "name": "ship-status",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Shows /ship-it progress as a status icon in front of the session title, and keeps the words of the title true to the work."
 }

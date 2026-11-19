@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { DEMO, bare, classify, cleanTopic, following, fresh, idle, marked, marksNewSession, needsApproval, newWork, parseCfg, parseRun, parseTopic, pause, recent, resume, sameWords, settle, started, starting, statusFor, tidy, titleFor, topicPrompt, topicRules, worthChecking } from './steps'
+import { DEMO, bare, classify, cleanTopic, cleanWords, following, fresh, idle, marked, marksNewSession, needsApproval, newWork, parseCfg, parseRun, parseTopic, pause, recent, resume, sameWords, settle, started, starting, statusFor, tidy, titleFor, topicPrompt, topicRules, worthChecking } from './steps'
 import type { Kind, Outcome, Run } from './steps'
 
 const SHIP = '\u{1F6A2}'
@@ -476,6 +476,15 @@ describe('the words of the title', () => {
     expect(cleanTopic('Invoice\nPDF   layout', 40)).toBe('Invoice PDF layout')
     expect(cleanTopic('Invoice PDF page breaks for the very long monthly statement', 30)).toBe('Invoice PDF page breaks for')
     expect(cleanTopic('x'.repeat(60), 40)).toBe('x'.repeat(40))
+  })
+
+  test('the words a person types are one line, with no icon of ours in front', () => {
+    expect(cleanWords('  Release   notes\tdraft ')).toBe('Release notes draft')
+    expect(cleanWords(`${BOLT}  Release notes draft`)).toBe('Release notes draft')
+    expect(cleanWords(`${SHIP}${BOLT} Release notes draft`)).toBe('Release notes draft')
+    expect(cleanWords(BOLT)).toBe('')
+    expect(cleanWords('   ')).toBe('')
+    expect(cleanWords('Fix the 3/7 split')).toBe('Fix the 3/7 split')
   })
 
   test('two titles are the same when their words are', () => {
