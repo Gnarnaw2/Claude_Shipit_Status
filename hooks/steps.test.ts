@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { DEMO, bare, classify, fresh, idle, marksNewSession, needsApproval, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
+import { DEMO, bare, classify, cleanTopic, following, fresh, idle, marked, marksNewSession, needsApproval, newWork, parseCfg, parseRun, parseTopic, pause, recent, resume, sameWords, settle, started, starting, statusFor, tidy, titleFor, topicPrompt, topicRules, worthChecking } from './steps'
 import type { Kind, Outcome, Run } from './steps'
 
 const SHIP = '\u{1F6A2}'
@@ -335,7 +335,7 @@ describe('what the person sees', () => {
 })
 
 describe('a new session', () => {
-  test('is marked in a worktree by default, anywhere with always, nowhere with never', () => {
+  test('is marked in a worktree with worktree, anywhere with always, nowhere with never', () => {
     expect(marksNewSession('worktree', true)).toBe(true)
     expect(marksNewSession('worktree', false)).toBe(false)
     expect(marksNewSession('always', false)).toBe(true)
@@ -394,5 +394,92 @@ describe('what was saved', () => {
     expect(parseRun({ ...run, phase: 'sparkle' })).toBeUndefined()
     expect(parseRun({ ...run, active: 'yes' })).toBeUndefined()
     expect(parseRun(undefined)).toBeUndefined()
+  })
+
+  test('the choice not to follow the work is kept with the marking', () => {
+    const off = following({ isOn: true, base: 'a' }, false)
+    expect(off).toEqual({ isOn: true, base: 'a', isTopicOff: true })
+    expect(marked(off, true, 'b')).toEqual({ isOn: true, base: 'b', isTopicOff: true })
+    expect(marked(off, false, 'b')).toEqual({ isOn: false, base: 'b', isTopicOff: true })
+    expect(following(off, true)).toEqual({ isOn: true, base: 'a' })
+    expect(marked(undefined, true, 'b')).toEqual({ isOn: true, base: 'b' })
+    expect(parseCfg(off)).toEqual(off)
+    expect(parseCfg({ isOn: true, base: 'a', isTopicOff: 'yes' })).toEqual({ isOn: true, base: 'a' })
+  })
+})
+
+describe('the words of the title', () => {
+  const QUOTE_OPEN = String.fromCodePoint(0x201c)
+  const QUOTE_CLOSE = String.fromCodePoint(0x201d)
+  const ROCKET = String.fromCodePoint(0x1f680)
+  const ELLIPSIS = String.fromCodePoint(0x2026)
+
+  test('tidy drops the harness notes and runs of white space', () => {
+    expect(tidy('Fix the build\n\n  please <system-reminder>today is a day</system-reminder>')).toBe('Fix the build please')
+    expect(tidy('<command-name>/x</command-name> hello')).toBe('hello')
+  })
+
+  test('a prompt is worth checking when it is more than a word and no slash command', () => {
+    expect(worthChecking('Look at the invoice PDF layout', 8)).toBe(true)
+    expect(worthChecking('yes', 8)).toBe(false)
+    expect(worthChecking('  do it  ', 8)).toBe(false)
+    expect(worthChecking('/ship-status topic now', 8)).toBe(false)
+    expect(worthChecking('<system-reminder>a note</system-reminder>', 8)).toBe(false)
+  })
+
+  test('what was said ends with the new prompt, once, without empty rows or slash commands', () => {
+    const history = [
+      { role: 'user', text: 'Add CSV export' },
+      { role: 'assistant', text: '' }, // only tool calls
+      { role: 'user', text: '/ship-status' },
+      { role: 'assistant', text: 'Done.' },
+      { role: 'user', text: 'Now the invoice PDF <system-reminder>a note</system-reminder>' },
+    ]
+    expect(recent(history, 'Now the invoice PDF', 6, 100)).toEqual([
+      { role: 'user', text: 'Add CSV export' },
+      { role: 'assistant', text: 'Done.' },
+      { role: 'user', text: 'Now the invoice PDF' },
+    ])
+  })
+
+  test('only the newest lines are kept, and a long one is shortened', () => {
+    const history = Array.from({ length: 10 }, (_, at) => ({ role: at % 2 === 0 ? 'user' : 'assistant', text: `message ${at}` }))
+    expect(recent(history, '', 3, 100).map(line => line.text)).toEqual(['message 7', 'message 8', 'message 9'])
+    expect(recent([], 'x'.repeat(50), 6, 10)).toEqual([{ role: 'user', text: `${'x'.repeat(9)}${ELLIPSIS}` }])
+  })
+
+  test('the question names the title and what was said, and the rules name the limit', () => {
+    const prompt = topicPrompt('Add CSV export', [{ role: 'user', text: 'hello there' }])
+    expect(prompt).toContain('Current title: Add CSV export')
+    expect(prompt).toContain('[user] hello there')
+    expect(topicPrompt('', [])).toContain('Current title: (none)')
+    expect(topicRules(32)).toContain('at most 32 characters')
+  })
+
+  test('the answer is read for its new title', () => {
+    const read = (reply: string): string | undefined => parseTopic(reply, 'Add CSV export', 40)
+    expect(read('SAME')).toBeUndefined()
+    expect(read('NEW: Invoice PDF page breaks')).toBe('Invoice PDF page breaks')
+    expect(read('new - Invoice PDF page breaks.')).toBe('Invoice PDF page breaks')
+    expect(read(`NEW: ${QUOTE_OPEN}Invoice PDF page breaks${QUOTE_CLOSE}`)).toBe('Invoice PDF page breaks')
+    expect(read('Sure!\nNEW: Invoice PDF page breaks')).toBe('Invoice PDF page breaks') // a line of its own
+    expect(read('NEW: **Title:** Login rate limits')).toBe('Login rate limits') // markdown and a label
+    expect(read('NEW: add csv export.')).toBeUndefined() // the same words
+    expect(read('NEW:')).toBeUndefined()
+    expect(read('NEW: ok')).toBeUndefined() // too short to mean anything
+    expect(read('Something else entirely')).toBeUndefined()
+    expect(read('Newest request is about invoices')).toBeUndefined()
+  })
+
+  test('a title loses its pictures, is cut at a word, and stays on one line', () => {
+    expect(cleanTopic(`${ROCKET} Ship the release`, 40)).toBe('Ship the release')
+    expect(cleanTopic('Invoice\nPDF   layout', 40)).toBe('Invoice PDF layout')
+    expect(cleanTopic('Invoice PDF page breaks for the very long monthly statement', 30)).toBe('Invoice PDF page breaks for')
+    expect(cleanTopic('x'.repeat(60), 40)).toBe('x'.repeat(40))
+  })
+
+  test('two titles are the same when their words are', () => {
+    expect(sameWords('Add CSV export!', 'add  csv export')).toBe(true)
+    expect(sameWords('Add CSV export', 'Add PDF export')).toBe(false)
   })
 })

@@ -1,6 +1,6 @@
 import type { EngineInterface, McpToolResult, Register, Timer } from 'claude-code'
 
-import { DEMO, LAST_STEP, bare, classify, fresh, idle, marksNewSession, needsApproval, newWork, parseCfg, parseRun, pause, resume, settle, started, starting, statusFor, titleFor } from './steps'
+import { DEMO, LAST_STEP, bare, classify, following, fresh, idle, marked, marksNewSession, needsApproval, newWork, parseCfg, parseRun, parseTopic, pause, recent, resume, settle, started, starting, statusFor, titleFor, topicPrompt, topicRules, worthChecking } from './steps'
 import type { Cfg, NewSessionMark, Run } from './steps'
 
 // The desktop app's own session tools, reached through $.mcp.call. They change
@@ -16,20 +16,34 @@ const RENAME_TIMEOUT_MS = 6000
 const VERIFY_DELAY_MS = 1500
 const MAX_REASSERTS = 3
 const NOTE_LIMIT = 60
-// A new session in a git worktree wears the bolt from its first prompt, so nobody has to type it in: a title
-// typed by hand counts as the person's, and the app then asks for their approval before a mod may change it.
-// 'always' marks every new session, 'never' leaves a session alone until its first ship-it.
-const NEW_SESSION_MARK: NewSessionMark = 'worktree'
+// A new session wears the bolt from its first prompt, so nobody has to type it in: a title typed by hand
+// counts as the person's, and the app then asks for their approval before a mod may change it. 'worktree'
+// marks only the sessions in a git worktree, 'never' leaves a session alone until its first ship-it.
+const NEW_SESSION_MARK: NewSessionMark = 'always'
 // The app names a new session a moment after its first prompt, and a name given before that would stop it
 // from naming the session at all, so marking waits for the app's name.
 const NEW_SESSION_DELAY_MS = 8000
 const NEW_SESSION_RETRY_MS = 4000
 const NEW_SESSION_TRIES = 8
 
+// The words of the title follow the work. At each prompt the person types, a small model reads the latest
+// messages and says whether the session has moved on to a different task than its title names; if it has, it
+// names the new one, and the icon stays in front. TOPIC_TITLES false leaves the words of the title alone.
+const TOPIC_TITLES = true
+const TOPIC_MODEL = 'haiku'
+const TOPIC_MAX_CHARS = 40 // the distinctive words come first, so a title the sidebar clips still tells sessions apart
+const TOPIC_MIN_PROMPT_CHARS = 8 // "yes" and "do it" cannot change the subject
+const TOPIC_LINES = 6 // how many of the latest messages the model reads
+const TOPIC_LINE_CHARS = 300
+const TOPIC_TIMEOUT_MS = 20000
+const TOPIC_MAX_FAILURES = 3 // answers missing in a row before the checks stop; /ship-status topic now tries again
+
 const USAGE = [
-  '/ship-status                where ship-it stands and whether this worktree is being marked',
+  '/ship-status                where ship-it stands and how this session is being marked',
   '/ship-status demo           preview every step on the title',
   '/ship-status on | off       put the icon on the title, or leave the title alone',
+  '/ship-status topic          whether the words of the title follow the work, and what the last check said',
+  '/ship-status topic on | off | now   follow the work, stop following it, or check this moment',
   '/ship-status step <0-7 | wait | fail | conflict | done | work | idle>   set it by hand',
   '/ship-status log            what the mod did lately, for when something looks wrong',
 ].join('\n')
@@ -63,6 +77,12 @@ let reasserts = 0
 
 let isNewSessionChecked = false // the first turn was looked at: a session is only ever taken for a new one once
 let newSessionTimer: Timer | undefined
+
+let isTopicChecking = false // the model is being asked: one question at a time
+let topicId = 0 // which question is the live one, so that a late answer to a forgotten question cannot free the next
+let topicFailures = 0 // answers missing in a row
+let isTopicBroken = false // too many missing: the checks have stopped
+let lastTopic = '' // what the last check came to, for /ship-status topic
 
 const notes: string[] = []
 
@@ -253,6 +273,8 @@ function resetTitleState(): void {
   isNewSessionChecked = true // whoever started this took the session in hand: no bolt of the mod's own accord
   newSessionTimer?.cancel()
   newSessionTimer = undefined
+  topicFailures = 0 // and the model gets another chance
+  isTopicBroken = false
 }
 
 // ---- showing the run -------------------------------------------------------
@@ -382,13 +404,124 @@ async function markNewSession($: EngineInterface, tries: number): Promise<void> 
       return
     }
     note(`new session "${base}": the bolt goes on, from its first prompt`)
-    cfg = { isOn: true, base }
+    cfg = marked(cfg, true, base)
     run = fresh()
     commit($, true)
     scheduleVerify($)
   } catch (error) {
     debug($, `could not mark a new session: ${message(error)}`)
   }
+}
+
+// ---- the words of the title ------------------------------------------------
+
+// At each prompt the person types, once the session is marked: has the work moved on from what the title
+// says? Nothing waits for the answer. The prompt goes on its way, and the title changes a moment later if it should.
+function noticeTopic($: EngineInterface, text: string): void {
+  if (!TOPIC_TITLES || isTopicBroken || isTopicChecking || cfg?.isOn !== true || cfg.isTopicOff === true) return
+  if (run.active || !shouldMark() || !worthChecking(text, TOPIC_MIN_PROMPT_CHARS)) return
+  checkTopic($, text).catch(error => debug($, `title check failed: ${message(error)}`))
+}
+
+function topicFailed($: EngineInterface, why: string): string {
+  topicFailures += 1
+  note(`topic: no answer (${topicFailures} of ${TOPIC_MAX_FAILURES}): ${why}`)
+  if (topicFailures >= TOPIC_MAX_FAILURES && !isTopicBroken) {
+    isTopicBroken = true
+    lastTopic = 'stopped, the model gave no answer'
+    $.ui.log(`ship-status: the model gave no answer ${TOPIC_MAX_FAILURES} times in a row (${why}), so the words of the title stay as they are. /ship-status topic now tries again.`)
+  }
+  return `The model gave no answer: ${why}`
+}
+
+// Asks the small model whether the newest request (`prompt`; empty for the conversation as it stands) moves the
+// session to a different task than its title names, and puts the new name behind the icon if it does.
+async function checkTopic($: EngineInterface, prompt: string): Promise<string> {
+  const before = cfg
+  if (before === undefined || !before.isOn) return 'ship-status is not marking this session, so there is no title to keep up. /ship-status on starts it.'
+  if (isTopicChecking) return 'A check is already running.'
+  const id = ++topicId
+  isTopicChecking = true
+  // A call that never comes back must not stop the checks for the rest of the session.
+  const watchdog = $.clock.after(TOPIC_TIMEOUT_MS * 3, () => {
+    if (id === topicId) isTopicChecking = false
+  })
+  try {
+    let history: readonly { role: string; text: string }[] = []
+    try {
+      history = await $.session.messages()
+    } catch (error) {
+      note(`topic: could not read the conversation: ${message(error)}`) // the prompt alone is still something to go on
+    }
+    const said = recent(history, prompt, TOPIC_LINES, TOPIC_LINE_CHARS)
+    if (said.length === 0) return 'Nothing has been said yet to go on.'
+    const reply = await $.model.complete({
+      model: TOPIC_MODEL,
+      system: topicRules(TOPIC_MAX_CHARS),
+      prompt: topicPrompt(before.base, said),
+      maxTokens: 80,
+      effort: 'low',
+      timeoutMs: TOPIC_TIMEOUT_MS,
+    })
+    if (!reply.isAnswered) {
+      return topicFailed($, reply.reason === 'api-error' ? `api-error ${reply.status ?? 'with no response'}, ${reply.error}` : reply.reason)
+    }
+    topicFailures = 0
+    const title = parseTopic(reply.text, before.base, TOPIC_MAX_CHARS)
+    if (title === undefined) {
+      lastTopic = 'the work still fits the title'
+      note(`topic: the work still fits "${before.base}"`)
+      return `The work still fits "${before.base}".`
+    }
+    const now = cfg
+    if (now === undefined || !now.isOn || now.base !== before.base || run.active || isDemoing || !canRename) {
+      note(`topic: "${title}" dropped, the session changed while the model was thinking`)
+      return 'The session changed while the model was thinking, so the title was left alone.'
+    }
+    cfg = marked(now, true, title)
+    lastTopic = `"${now.base}" became "${title}"`
+    note(`topic: "${now.base}" -> "${title}"`)
+    commit($)
+    scheduleVerify($)
+    return `The title is now "${title}".`
+  } catch (error) {
+    return topicFailed($, message(error))
+  } finally {
+    watchdog.cancel()
+    if (id === topicId) isTopicChecking = false
+  }
+}
+
+function topicState(): string {
+  if (!TOPIC_TITLES) return 'off: TOPIC_TITLES is false in the mod'
+  if (cfg === undefined) return 'not started yet: it begins once the session is marked'
+  if (cfg.isTopicOff === true) return 'off for this session (/ship-status topic on turns it back on)'
+  if (!cfg.isOn) return 'waiting: ship-status is off for this session (/ship-status on)'
+  if (isTopicBroken) return 'stopped: the model gave no answer several times in a row (/ship-status topic now tries again)'
+  const last = lastTopic === '' ? 'nothing checked yet' : `last check: ${lastTopic}`
+  return `on: a small model reads each prompt you type and renames the session when the work moves on (${last})`
+}
+
+async function setTopic($: EngineInterface, arg: string): Promise<string> {
+  const word = arg.trim().toLowerCase()
+  if (word === '') return `Title words: ${topicState()}`
+  if (word === 'on' || word === 'off') {
+    if (cfg === undefined) return 'ship-status is not marking this session yet: the first ship-it or /ship-status on starts it.'
+    cfg = following(cfg, word === 'on')
+    persist($)
+    if (word === 'off') return 'The words of the title stay as they are from now on, whatever the work does. The icon still follows ship-it.'
+    isTopicBroken = false
+    topicFailures = 0
+    return 'The title follows the work again: a small model reads each prompt you type and renames the session when the work moves on.'
+  }
+  if (word === 'now') {
+    if (cfg?.isOn !== true) return 'ship-status is not marking this session, so there is no title to keep up. /ship-status on starts it.'
+    if (!canRename) return 'The app is not taking title changes right now: /ship-status says why.'
+    isTopicBroken = false
+    topicFailures = 0
+    return checkTopic($, '')
+  }
+  return USAGE
 }
 
 // How this session is marked. The title is read again at the start of every run,
@@ -404,15 +537,26 @@ async function choice($: EngineInterface): Promise<Cfg | undefined> {
     return cfg
   }
   note(`ship-it found the title "${bare(current)}"`)
-  return { isOn: true, base: bare(current) }
+  return marked(cfg, true, bare(current))
 }
 
 // ---- /ship-status ----------------------------------------------------------
 
+function startNote(mode: NewSessionMark): string {
+  switch (mode) {
+    case 'always':
+      return 'a new session gets the bolt from its first prompt, and the first ship-it puts its icon on'
+    case 'worktree':
+      return 'a new worktree session gets the bolt from its first prompt, and the first ship-it puts its icon on'
+    default:
+      return 'the first ship-it puts the icon on'
+  }
+}
+
 function describe(): string {
-  const marked =
+  const marking =
     cfg === undefined
-      ? 'not started yet (the first ship-it puts the icon on; a new worktree session gets the bolt from its first prompt)'
+      ? `not started yet (${startNote(NEW_SESSION_MARK)})`
       : cfg.isOn
         ? 'a status icon in front of the title'
         : 'off (/ship-status on turns it back on)'
@@ -424,7 +568,7 @@ function describe(): string {
       : sidebarNote !== ''
         ? `trouble: ${sidebarNote}`
         : 'can be changed'
-  return [`Worktree marking: ${marked}`, `ship-it: ${progress}`, `Sidebar title: ${sidebar}`].join('\n')
+  return [`Marking: ${marking}`, `ship-it: ${progress}`, `Title words: ${topicState()}`, `Sidebar title: ${sidebar}`].join('\n')
 }
 
 function showLog(): string {
@@ -474,17 +618,17 @@ async function setMarking($: EngineInterface, isOn: boolean): Promise<string> {
   if (!isOn) {
     if (cfg?.isOn === true) requestTitle($, cfg.base)
     clearStatus($)
-    cfg = { isOn: false, base: cfg?.base ?? '' }
+    cfg = marked(cfg, false, cfg?.base ?? '')
     persist($)
-    return 'ship-status is off: the original title is back and ship-it will not touch it. /ship-status on turns it on again.'
+    return 'ship-status is off: the icon is off the title (its words stay as they are) and neither ship-it nor the title check will touch it. /ship-status on turns it on again.'
   }
   resetTitleState()
   const current = await readTitle($)
   if (current === undefined && cfg === undefined) return "Cannot read this session's title, so there is nothing to mark."
-  cfg = { isOn: true, base: current === undefined ? (cfg?.base ?? '') : bare(current) }
+  cfg = marked(cfg, true, current === undefined ? (cfg?.base ?? '') : bare(current))
   commit($)
   scheduleVerify($)
-  return 'ship-status is on: ship-it puts its icon on this worktree from now on.'
+  return "ship-status is on: the icon goes on this session's title, ship-it moves it along, and the words follow the work."
 }
 
 async function setStep($: EngineInterface, arg: string): Promise<string> {
@@ -529,8 +673,8 @@ export const register: Register = on => {
     try {
       await $.command.register({
         name: 'ship-status',
-        description: 'Show or adjust how /ship-it progress is marked on this worktree',
-        argumentHint: '[demo | on | off | step | log]',
+        description: "Show or adjust how /ship-it progress and the session's work are marked on its title",
+        argumentHint: '[demo | on | off | topic | step | log]',
       })
     } catch (error) {
       debug($, `could not register /ship-status: ${message(error)}`)
@@ -617,6 +761,7 @@ export const register: Register = on => {
         run = moved
         commit($)
       }
+      noticeTopic($, e.text)
     }
     scheduleVerify($)
     return next(e)
@@ -635,6 +780,8 @@ export const register: Register = on => {
         return { text: await setMarking($, true) }
       case 'off':
         return { text: await setMarking($, false) }
+      case 'topic':
+        return { text: await setTopic($, arg) }
       case 'step':
         return { text: await setStep($, arg) }
       case 'log':

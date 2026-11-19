@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, SessionMessage } from 'claude-code'
 
 import { DEMO } from './steps'
 
@@ -18,6 +18,10 @@ const CHECK = '\u{2705}'
 const BOLT = '\u{26A1}'
 
 const BASE = 'Add CSV export'
+// A prompt with enough in it to be asked about, and the title the small model gives it.
+const LONG = 'Now a different thing: the invoice PDF splits its totals across two pages'
+const MOVED = 'Invoice PDF page breaks'
+const NOTHING_SPENT = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 type Options = {
   /** False plays a session with no desktop-app tools (a plain terminal). */
@@ -51,12 +55,34 @@ function world(on: On, options: Options = {}) {
     writes: 0,
     /** How many prompts the person has sent: 1 is a new session, more is one with a history. */
     turns: 5,
+    /** The conversation so far, as the engine reports it. */
+    messages: [] as SessionMessage[],
+    /** What the small model is asked, newest last. */
+    asked: [] as string[],
+    /** What it answers to each question, in turn; SAME once they run out. 'none' plays a call that gets no answer. */
+    answers: [] as string[],
+    /** Holds the next question back until `release` is called. */
+    hold: false,
+    release: () => {},
     settle: () => clock.settle(),
     advance: (ms: number) => clock.advance(ms),
   }
 
   on('session.id', () => ({ value: 'test-session' }))
   on('session.turns', () => ({ value: w.turns }))
+  on('session.messages', () => ({ value: w.messages }))
+  on('model.complete', async (_, e) => {
+    w.asked.push(e.prompt)
+    if (w.hold) {
+      w.hold = false
+      await new Promise<void>(resolve => {
+        w.release = resolve
+      })
+    }
+    const text = w.answers.shift() ?? 'SAME'
+    if (text === 'none') return { value: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: NOTHING_SPENT } }
+    return { value: { isAnswered: true, text, usage: NOTHING_SPENT } }
+  })
   on('command.register', () => ({ value: { command: 'ship-status' } }))
   on('mcp.call', async (_, e) => {
     if (options.hasDesktop === false || e.server !== 'ccd_session_mgmt') return { deny: 'no such server' }
@@ -342,7 +368,7 @@ test('/ship-status reports, sets a step by hand, and turns off and on', async ($
   expect(w.title).toBe(`${COMMIT} ${BASE}`)
 
   const off = await slash($, 'off')
-  expect(off.text).toContain('original title is back')
+  expect(off.text).toContain('icon is off the title')
   await w.settle()
   expect(w.title).toBe(BASE)
   expect(w.statuses.at(-1)).toBeUndefined()
@@ -647,15 +673,15 @@ test('a new session the app never names is left alone', async ($, on) => {
   expect((await slash($, 'log')).text).toContain('gave it no name')
 })
 
-test('a new session outside a worktree is left alone', async ($, on) => {
+test('a new session outside a worktree gets the bolt too', async ($, on) => {
   const w = world(on)
   w.turns = 1
   await start($)
   await startTurn($)
-  await w.advance(20000)
+  await w.advance(9000)
   await w.settle()
-  expect(w.titles).toEqual([])
-  expect((await slash($, 'log')).text).toContain('not in a worktree')
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  expect((await slash($, '')).text).toContain('a status icon in front of the title')
 })
 
 test('a session that already has a history is left to its first ship-it', async ($, on) => {
@@ -759,4 +785,221 @@ test('the mod stays quiet about titles until a ship-it has started', async ($, o
   await w.settle()
   expect(w.titles).toEqual([])
   expect(w.statuses).toEqual([])
+})
+
+// ---- the words of the title follow the work -----------------------------------
+
+const said = (role: 'user' | 'assistant', text: string): SessionMessage => ({ role, text, toolUses: [] })
+
+/** A session the mod has put the bolt on: new, named by the app, and nine seconds into its first prompt. */
+async function boltOn($: Engine, w: ReturnType<typeof world>): Promise<void> {
+  w.turns = 1
+  await start($)
+  await startTurn($)
+  await w.advance(9000)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+}
+
+test('the title follows the work: a prompt that moves to another task renames the session behind its icon', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.messages = [said('user', 'Add CSV export to the reports page'), said('assistant', 'Done: the export button is in.')]
+  w.answers = [`NEW: "${MOVED}."`]
+  await typed($, LONG)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${MOVED}`)
+  expect(w.asked).toHaveLength(1)
+  expect(w.asked[0]).toContain(`Current title: ${BASE}`)
+  expect(w.asked[0]).toContain('[user] Add CSV export to the reports page')
+  expect(w.asked[0]).toContain('[assistant] Done: the export button is in.')
+  expect(w.asked[0]).toContain(`[user] ${LONG}`)
+  const state = (await slash($, '')).text
+  expect(state).toContain('Title words: on')
+  expect(state).toContain(`"${BASE}" became "${MOVED}"`)
+  expect((await slash($, 'log')).text).toContain(`topic: "${BASE}" -> "${MOVED}"`)
+
+  await ship($) // a ship-it carries on from the new words
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${MOVED}`)
+})
+
+test('a prompt on the same task leaves the words alone and writes nothing', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  const writes = w.writes
+  await typed($, 'Also make the export button blue, please')
+  await w.settle()
+  expect(w.asked).toHaveLength(1)
+  expect(w.writes).toBe(writes)
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  expect((await slash($, 'topic')).text).toContain('still fits')
+})
+
+test('an answer that only rewords the title changes nothing', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  const writes = w.writes
+  w.answers = ['NEW: add CSV export.']
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toHaveLength(1)
+  expect(w.writes).toBe(writes)
+})
+
+test('slash commands, short answers and prompts the person did not type are not asked about', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  await typed($, '/review the whole repository again')
+  await typed($, 'yes')
+  await $.prompt.submit({ text: LONG, command: { name: 'model', args: '' }, wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: LONG, isMeta: true, wait: false, origin: { kind: 'task-notification' } })
+  await w.settle()
+  expect(w.asked).toEqual([])
+})
+
+test('no question is asked while a ship-it is under way', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  await ship($)
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toEqual([])
+})
+
+test('a session nothing has marked is not asked about', async ($, on) => {
+  const w = world(on) // five prompts behind it, and no ship-it yet
+  await start($)
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toEqual([])
+})
+
+test('a model that gives no answer three times in a row stops the checks until /ship-status topic now', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.answers = ['none', 'none', 'none']
+  for (const text of [`${LONG} one`, `${LONG} two`, `${LONG} three`]) {
+    await typed($, text)
+    await w.settle()
+  }
+  expect(w.asked).toHaveLength(3)
+  expect(w.logs.filter(line => line.includes('gave no answer'))).toHaveLength(1)
+  expect((await slash($, 'topic')).text).toContain('stopped')
+
+  await typed($, `${LONG} four`)
+  await w.settle()
+  expect(w.asked).toHaveLength(3) // not asked again
+
+  w.messages = [said('user', 'Work on dark mode for the settings page')]
+  w.answers = ['NEW: Dark mode for settings']
+  expect((await slash($, 'topic now')).text).toContain('Dark mode for settings')
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} Dark mode for settings`)
+})
+
+test('a title the app wants approval for is explained once, and the checks stop there', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.approval = 'engine'
+  w.answers = [`NEW: ${MOVED}`]
+  await typed($, LONG)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${BASE}`)
+  const told = w.logs.filter(line => line.includes('treats it as one you set'))
+  expect(told).toHaveLength(1)
+  expect(told[0]).toContain(`rename this session to "${BOLT} ${MOVED}"`)
+
+  await typed($, `${LONG} again`)
+  await w.settle()
+  expect(w.asked).toHaveLength(1) // no point asking when the answer cannot be used
+})
+
+test('/ship-status topic off keeps the words, and on brings the checks back', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  expect((await slash($, 'topic off')).text).toContain('stay as they are')
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toEqual([])
+  expect((await slash($, 'topic')).text).toContain('off for this session')
+  expect((await slash($, '')).text).toContain('Title words: off')
+
+  expect((await slash($, 'topic on')).text).toContain('follows the work again')
+  w.answers = [`NEW: ${MOVED}`]
+  await typed($, `${LONG} again`)
+  await w.settle()
+  expect(w.title).toBe(`${BOLT} ${MOVED}`)
+})
+
+test('the choice not to follow the work comes back after a reload, and /ship-status on keeps it', async ($, on) => {
+  const w = world(on, {
+    store: {
+      'cfg:test-session': { isOn: true, base: BASE, isTopicOff: true },
+      'run:test-session': { active: false, step: 0, strong: 0, phase: 'working', pushed: false },
+    },
+  })
+  await start($)
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toEqual([])
+
+  await slash($, 'on')
+  await typed($, `${LONG} again`)
+  await w.settle()
+  expect(w.asked).toEqual([])
+})
+
+test('a check that finishes after ship-status was turned off changes nothing', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.hold = true
+  w.answers = [`NEW: ${MOVED}`]
+  await typed($, LONG)
+  await w.settle() // the model is still thinking
+  expect(w.asked).toHaveLength(1)
+  await slash($, 'off')
+  await w.settle()
+  w.release()
+  await w.settle()
+  expect(w.title).toBe(BASE)
+  expect(w.titles.some(title => title.includes(MOVED))).toBe(false)
+  expect((await slash($, 'log')).text).toContain('dropped')
+})
+
+test('a question the model never answers does not stop the next one for good', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.hold = true
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toHaveLength(1)
+  await typed($, `${LONG} again`)
+  await w.settle()
+  expect(w.asked).toHaveLength(1) // one question at a time
+
+  await w.advance(61000) // the mod gives up waiting
+  await w.settle()
+  w.answers = [`NEW: ${MOVED}`]
+  await typed($, `${LONG} once more`)
+  await w.settle()
+  expect(w.asked).toHaveLength(2)
+  expect(w.title).toBe(`${BOLT} ${MOVED}`)
+})
+
+test('a ship-it that begins while the model is thinking keeps its own title', async ($, on) => {
+  const w = world(on)
+  await boltOn($, w)
+  w.hold = true
+  w.answers = [`NEW: ${MOVED}`]
+  await typed($, LONG)
+  await w.settle()
+  expect(w.asked).toHaveLength(1) // the model is thinking
+  await ship($)
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+  w.release()
+  await w.settle()
+  expect(w.title).toBe(`${SHIP} ${BASE}`)
+  expect((await slash($, 'log')).text).toContain('dropped')
 })

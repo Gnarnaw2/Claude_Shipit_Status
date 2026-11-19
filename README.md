@@ -1,7 +1,8 @@
 # ship-status
 
-A Claude Code mod that shows how far `/ship-it` has got on a worktree, as an icon in front of the
-session's title in the desktop app's sidebar.
+A Claude Code mod for the desktop app's sidebar. It shows how far `/ship-it` has got as an icon in front
+of the session's title, and it keeps the words of the title true to what the session is working on, so
+sessions can still be told apart after they turn to something else.
 
 The first `/ship-it` in a session puts the icon on (no question is asked). From then on it changes at
 every step:
@@ -31,13 +32,37 @@ is under way, and it stays that way until the next `/ship-it`. A slash command t
 (such as `/ship-status`) does not count. If you would rather have a plain title than a bolt, set
 `working` to `''` in `PHASE_ICON` (`hooks/steps.ts`).
 
-A new session in a git worktree gets the bolt without a ship-it: a few seconds after its first prompt,
-once the app has named the session, ⚡ goes in front of the name, and the first `/ship-it` carries on
-from there. Nobody has to type it in, which matters: a title typed by hand counts as the person's, and
-the desktop app then asks for the person's approval before ship-status may change it (see "If it looks
-wrong"). A session with a history (a resume, an older one) and a session outside a worktree wait for the
-first `/ship-it`. `NEW_SESSION_MARK` in `hooks/register.ts` changes that: `'always'` marks every new
-session, `'never'` none.
+A new session gets the bolt without a ship-it: a few seconds after its first prompt, once the app has
+named the session, ⚡ goes in front of the name, and the first `/ship-it` carries on from there. Nobody
+has to type it in, which matters: a title typed by hand counts as the person's, and the desktop app then
+asks for the person's approval before ship-status may change it (see "If it looks wrong"). A session
+with a history (a resume, an older one) waits for the first `/ship-it`. `NEW_SESSION_MARK` in
+`hooks/register.ts` changes that: `'worktree'` marks only new sessions in a git worktree, `'never'` none.
+
+## The words follow the work
+
+A session often turns to something else, and a sidebar of titles that all open with ⚡ and name the
+first task does not help. So once a session is marked, the words after the icon follow the work.
+
+At each prompt you type, a small model (Haiku) reads the title as it stands, the last few messages and
+your new prompt, and answers on one line: the work is the same, or it has moved to a different task and
+here is its title. A follow-up, a question, a fix, a commit or a push of the same work is the same task.
+A new title is a short noun phrase of at most 40 characters with its most distinctive words first, so it
+still tells sessions apart when the sidebar clips it. The icon stays in front, and the next `/ship-it`
+carries on from the new words: `⚡ Invoice PDF page breaks`, then `🔨 Invoice PDF page breaks`.
+
+- Nothing waits for the answer: the prompt goes on its way, and the title changes a moment later.
+- Slash commands, very short answers ("yes", "do it") and prompts you did not type are not asked about,
+  and nothing is asked while a `/ship-it` is under way.
+- A check is one small request through the session's own client and credentials, counted in `/cost`
+  like any other. The model reads the title, your new prompt and the last few messages, each cut to 300
+  characters. It needs a build of Claude Code that has `$.model` (2.1.321 and newer do). On one that
+  does not, or when the model never answers, the checks give up after three tries and the rest keeps
+  working.
+- `/ship-status topic off` keeps the words of one session as they are. `TOPIC_TITLES` in
+  `hooks/register.ts` turns the checks off for every session.
+- A title you typed by hand is yours: the app asks for your approval before the mod may replace it, and a
+  mod cannot ask. ship-status then says so once and stops (see "If it looks wrong").
 
 ## Install
 
@@ -74,10 +99,13 @@ is no sidebar, so only the status line is used.
 
 | Command                                                      | Does                                                              |
 | ------------------------------------------------------------ | ----------------------------------------------------------------- |
-| `/ship-status`                                               | shows whether this worktree is marked and where ship-it stands    |
+| `/ship-status`                                               | shows how this session is marked, where ship-it stands and what the last title check said |
 | `/ship-status demo`                                          | previews every step on the title for about 20 s, then restores it |
-| `/ship-status off`                                           | puts the original title back and leaves the title alone           |
+| `/ship-status off`                                           | takes the icon off and leaves the title alone (its words stay)    |
 | `/ship-status on`                                            | marks the title again, and tries a title the app refused again    |
+| `/ship-status topic`                                         | says whether the words follow the work, and what the last check came to |
+| `/ship-status topic on\|off`                                  | makes the words of this session follow the work, or stay as they are |
+| `/ship-status topic now`                                     | checks this moment, and tries again after the checks gave up      |
 | `/ship-status step <0-7\|wait\|fail\|conflict\|done\|work\|idle>` | sets the display by hand if it ever gets out of step         |
 | `/ship-status log`                                           | lists what the mod did lately, for when something looks wrong     |
 
@@ -98,7 +126,8 @@ is no sidebar, so only the status line is used.
   approve the app's prompt, and run `/ship-status on`: a title Claude renamed with the person's
   approval is no longer counted as theirs, so ship-status can change it from then on. A write the mod
   makes of its own accord (the bolt on a new session, putting an icon back) that the app refuses for
-  this reason is noted in `/ship-status log` and shown by `/ship-status`, but not announced.
+  this reason is noted in `/ship-status log` and shown by `/ship-status`, but not announced. A new
+  title from a check that the app refuses is announced once, since the words then cannot follow the work.
 - You never need `/ship-status on` before `/ship-it`. It is only for turning marking back on after
   `/ship-status off`.
 - A plugin installed from a marketplace does not update by itself, and `/reload-plugins` only re-reads
@@ -114,6 +143,9 @@ is no sidebar, so only the status line is used.
 - Icons and step names: `STEPS` and `PHASE_ICON` in `hooks/steps.ts`.
 - Which new sessions get the bolt before any ship-it, and how long the app is given to name them:
   `NEW_SESSION_MARK` and `NEW_SESSION_DELAY_MS` in `hooks/register.ts`.
+- The title check: `TOPIC_TITLES` (on or off), `TOPIC_MODEL`, `TOPIC_MAX_CHARS` (the longest new title),
+  `TOPIC_MIN_PROMPT_CHARS`, `TOPIC_LINES` and `TOPIC_LINE_CHARS` (how much of the conversation the model
+  reads), and the rules it is given, `topicRules` in `hooks/steps.ts`.
 - Another skill or command name than `ship-it`: the matcher on `skill.prompt` in `hooks/register.ts`.
 
 ## Checks

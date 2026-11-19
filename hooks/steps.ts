@@ -12,8 +12,20 @@ export type Phase = 'idle' | 'running' | 'waiting' | 'failed' | 'conflict' | 'do
 export type Cfg = {
   /** False once the person ran `/ship-status off`: the title is left alone. */
   isOn: boolean
-  /** The title as it stood without an icon: what `off` puts back. */
+  /** The title as it stood without an icon: what `off` puts back. It follows the work while the check below is on. */
   base: string
+  /** True once the person ran `/ship-status topic off`: the words of the title stay as they are. */
+  isTopicOff?: true
+}
+
+/** `previous` marked on or off with a new title, still keeping the person's choice about the title following the work. */
+export function marked(previous: Cfg | undefined, isOn: boolean, base: string): Cfg {
+  return previous?.isTopicOff === true ? { isOn, base, isTopicOff: true } : { isOn, base }
+}
+
+/** `cfg` with the title following the work, or not. */
+export function following(cfg: Cfg, isFollowing: boolean): Cfg {
+  return isFollowing ? { isOn: cfg.isOn, base: cfg.base } : { isOn: cfg.isOn, base: cfg.base, isTopicOff: true }
 }
 
 /** Where one /ship-it run stands. */
@@ -449,14 +461,129 @@ export const DEMO: readonly Run[] = [
 ]
 
 // ---------------------------------------------------------------------------
+// Keeping the words of the title true to the work
+
+/** One message of the conversation, as the title check reads it. */
+export type Said = { role: 'user' | 'assistant'; text: string }
+
+// Notes the harness wraps around a message: they are not part of what was said.
+const WRAPPER = /<(system-reminder|local-command-\w+|command-\w+|ide_\w+)>[\s\S]*?<\/\1>/g
+
+/** A message as plain words: the harness's notes taken out, every run of white space made one space. */
+export function tidy(text: string): string {
+  return text.replace(WRAPPER, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function shorten(text: string, max: number): string {
+  const chars = Array.from(text)
+  return chars.length <= max ? text : `${chars.slice(0, Math.max(1, max - 1)).join('')}${ELLIPSIS}`
+}
+
+/** Whether a prompt could change the subject: words of the person's own, not a slash command or a bare "yes". */
+export function worthChecking(prompt: string, minChars: number): boolean {
+  const text = tidy(prompt)
+  return text.length >= minChars && !text.startsWith('/')
+}
+
+/**
+ * The latest messages of the conversation, oldest first, ending with the prompt that is just being sent. The
+ * engine may already hold that prompt as its newest message, and it is then taken once. A slash command is no
+ * part of the work, so it is left out.
+ */
+export function recent(history: readonly { role: string; text: string }[], prompt: string, count: number, chars: number): Said[] {
+  const said: Said[] = []
+  for (let at = history.length - 1; at >= 0 && said.length < count; at -= 1) {
+    const message = history[at]
+    if (message === undefined) continue
+    const role = message.role === 'user' || message.role === 'assistant' ? message.role : undefined
+    const text = tidy(message.text)
+    if (role === undefined || text === '' || (role === 'user' && text.startsWith('/'))) continue
+    said.push({ role, text })
+  }
+  said.reverse()
+  const asked = tidy(prompt)
+  if (asked !== '') {
+    const last = said[said.length - 1]
+    if (last?.role === 'user' && (last.text === asked || last.text.startsWith(asked))) said.pop()
+    said.push({ role: 'user', text: asked })
+  }
+  return said.slice(-count).map(line => ({ role: line.role, text: shorten(line.text, chars) }))
+}
+
+/** What the small model is told once: how to judge, and how to answer. */
+export function topicRules(max: number): string {
+  return [
+    'You keep the title of a coding session true to its work. Its owner has many sessions open and tells them apart by title.',
+    'Judge whether the newest request moves the session to a different task than the one its current title names.',
+    '- The same task: follow-ups, questions, fixes, reviews, tests, commits, pushes and clean-up of the same work, side questions, short replies.',
+    '- A new task: a clearly different feature, bug, system or subject.',
+    'With no current title, the answer is a new one.',
+    'Answer with one line and nothing else: SAME, or NEW: followed by the new title.',
+    `A title is a short noun phrase naming the specific thing being worked on: at most ${max} characters, the most distinctive words first so that it differs from the other sessions at a glance, no leading verb such as Fix, Add or Update, no emoji, no quotes, no final period.`,
+    'An answer looks like this: SAME. Or this: NEW: Invoice PDF page breaks',
+  ].join('\n')
+}
+
+/** The one message asked of the model: the title as it stands, and what was said lately. */
+export function topicPrompt(current: string, said: readonly Said[]): string {
+  return [
+    `Current title: ${current === '' ? '(none)' : current}`,
+    '',
+    'The latest messages, oldest first. The last one is the newest request.',
+    ...said.map(line => `[${line.role}] ${line.text}`),
+  ].join('\n')
+}
+
+const MIN_TOPIC = 3
+// Everything that is a picture rather than a word: emoji, flags, and the joiners and selectors that build them.
+const PICTURES = /[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Variation_Selector}\p{Join_Control}\p{Me}]/gu
+// What a model likes to wrap a title in: quotes of every kind, and markdown.
+const WRAPPING = /^[\s"'`*_#>\p{Pi}\p{Pf}]+|[\s"'`*_\p{Pi}\p{Pf}]+$/gu
+const LABEL = /^(?:new\s+)?(?:task|title)\s*[:\p{Pd}]\s*/iu
+const TAIL = /[\s.:;,\p{Pd}]+$/u
+const NOT_WORD = /[^\p{L}\p{N}]+/gu
+const NEW_LINE = /^NEW\b\s*[:\p{Pd}]?\s*(.*)$/iu
+
+function fitTitle(text: string, max: number): string {
+  const chars = Array.from(text)
+  if (chars.length <= max) return text
+  const cut = chars.slice(0, max).join('')
+  const space = cut.lastIndexOf(' ')
+  return (space >= max / 2 ? cut.slice(0, space) : cut).replace(TAIL, '')
+}
+
+/** A title a model suggested, made fit for the sidebar: no pictures, quotes or labels, one line, at most `max` characters. */
+export function cleanTopic(raw: string, max: number): string {
+  const text = raw.replace(PICTURES, ' ').replace(/\p{Cc}+/gu, ' ').replace(/\s+/g, ' ')
+  return fitTitle(text.replace(WRAPPING, '').replace(LABEL, '').replace(WRAPPING, '').replace(TAIL, ''), max)
+}
+
+/** Whether two titles say the same words, whatever their case or punctuation. */
+export function sameWords(a: string, b: string): boolean {
+  return a.toLowerCase().replace(NOT_WORD, '') === b.toLowerCase().replace(NOT_WORD, '')
+}
+
+/** The new title in the model's answer, or undefined when it said the work is the same or named nothing new. */
+export function parseTopic(reply: string, current: string, max: number): string | undefined {
+  for (const line of reply.split(/\r?\n/)) {
+    const found = NEW_LINE.exec(line.trim())
+    if (found === null) continue
+    const title = cleanTopic(found[1] ?? '', max)
+    return title.length >= MIN_TOPIC && !sameWords(title, current) ? title : undefined
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
 // What was saved
 
 const PHASES: readonly string[] = ['idle', 'running', 'waiting', 'failed', 'conflict', 'done', 'working']
 
 export function parseCfg(raw: unknown): Cfg | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined
-  const { isOn, base: title } = raw as Record<string, unknown>
-  return typeof isOn === 'boolean' && typeof title === 'string' ? { isOn, base: title } : undefined
+  const { isOn, base: title, isTopicOff } = raw as Record<string, unknown>
+  if (typeof isOn !== 'boolean' || typeof title !== 'string') return undefined
+  return isTopicOff === true ? { isOn, base: title, isTopicOff } : { isOn, base: title }
 }
 
 export function parseRun(raw: unknown): Run | undefined {
